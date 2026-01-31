@@ -1,0 +1,27 @@
+# Starlight - AI Assistive Input Tool
+# Requires Python 3.10.x
+
+# UI Framework
+PyQt6>=6.6.0
+
+# Numerical & Image Processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# Screen Capture
+mss>=9.0.0
+dxcam>=0.0.5
+
+# AI Inference (GPU)
+onnxruntime-gpu>=1.16.0
+
+# TensorRT (optional, for maximum performance)
+# Install CUDA Toolkit 12.x first, then:
+# pip install tensorrt --extra-index-url https://pypi.nvidia.com
+
+# Input Handling
+pynput>=1.7.6
+keyboard>=0.13.5
+
+# Windows API
+pywin32>=306
