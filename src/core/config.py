@@ -18,6 +18,14 @@ class CaptureConfig:
     capture_width: int = 640
     capture_height: int = 640
     max_fps: int = 240
+    startup_warmup_frames: int = 10
+    max_frame_age_ms: int = 200
+    capture_buffer_size: int = 1
+    
+    # Capture mode: "screen", "window", "obs", "obs_stream"
+    capture_mode: str = "screen"
+    window_name: str = ""  # For window capture mode
+    obs_stream_url: str = "udp://127.0.0.1:5600"  # For OBS stream mode (e.g., UDP/RTMP)
     
     # Debug display
     debug_enabled: bool = True
@@ -27,20 +35,61 @@ class CaptureConfig:
 
 @dataclass
 class DetectionConfig:
-    """AI detection settings"""
-    model_path: str = "models/model.onnx"
-    confidence_threshold: float = 0.60
-    use_tensorrt: bool = True
-    trt_optimization_level: int = 3
-    async_inference: bool = False
+    """Color detection settings"""
+    # Device
+    color_device: str = "cpu"  # cpu, gpu
     
-    # Aim bones/points selection
+    # Aim target (still used for where to aim on bounding box)
     aim_bone: str = "upper_head"  # top_head, upper_head, head, neck, chest, etc.
     bone_scale: float = 1.0
     
-    # Class filtering
-    enabled_classes: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
-    disabled_classes: List[int] = field(default_factory=list)
+    # Color detection settings
+    color_preset: str = "purple"  # purple, purple2, yellow, yellow2, red, custom
+    color_space: str = "hsv"  # hsv, rgb
+    
+    # HSV range (used when color_space = hsv)
+    color_h_min: int = 130
+    color_h_max: int = 160
+    color_s_min: int = 100
+    color_s_max: int = 255
+    color_v_min: int = 100
+    color_v_max: int = 255
+    
+    # RGB range (used when color_space = rgb)
+    color_r_min: int = 162
+    color_r_max: int = 214
+    color_g_min: int = 0
+    color_g_max: int = 104
+    color_b_min: int = 205
+    color_b_max: int = 255
+    
+    # Color differential filters (RGB mode)
+    color_rg_diff: int = 82      # Minimum R-G difference
+    color_bg_diff: int = -255    # Minimum B-G difference
+    color_rb_max_diff: int = 255 # Maximum R-B difference
+    
+    # Color morphological operations
+    color_dilate: int = 2
+    color_erode: int = 1
+    color_closing: bool = False
+    color_closing_size: int = 2
+    
+    # Gaussian blur pre-processing
+    color_blur_enabled: bool = True
+    color_blur_size: int = 3  # Kernel size (odd number)
+    
+    # Color area filtering
+    color_min_area: int = 50
+    color_max_area: int = 50000
+    
+    # Detection smoothing (Anti-Wobble)
+    smoothing_enabled: bool = True
+    smoothing_window: int = 5       # Frame averaging window
+    smoothing_outlier: int = 50     # Max pixel jump before rejection
+    bbox_smoothing: float = 0.95    # BBox EMA (lower = more smooth)
+    
+    # Color head offset (0.0 = top, 0.5 = center, 1.0 = bottom)
+    color_head_offset: float = 0.15
 
 
 @dataclass
@@ -67,6 +116,21 @@ class AimConfig:
     # Smoothing
     smooth_x: float = 40.0
     smooth_y: float = 80.0
+    
+    # Sticky Aim (Close/Far smoothing)
+    sticky_aim_enabled: bool = True
+    sticky_aim_zone: int = 25       # Radius for sticky behavior (px)
+    smooth_x_close: float = 5.2     # X smoothing when close
+    smooth_x_far: float = 7.4       # X smoothing when far
+    smooth_y_close: float = 10.2    # Y smoothing when close
+    smooth_y_far: float = 16.1      # Y smoothing when far
+    
+    # PID Controller
+    pid_enabled: bool = True
+    pid_kp: float = 0.0002          # Proportional (responsiveness)
+    pid_ki: float = 0.0             # Integral (steady error)
+    pid_kd: float = 0.0006          # Derivative (damping)
+    pid_activation_dist: int = 10   # Distance at which PID engages (px)
 
 
 @dataclass
@@ -255,7 +319,21 @@ class FlickHumanizerConfig:
 @dataclass
 class MouseConfig:
     """Mouse/HID settings"""
-    device: str = "internal"  # internal (SendInput)
+    device: str = "internal"  # internal (SendInput) or arduino
+    
+    # Arduino settings
+    arduino_port: str = ""  # COM port (auto-detect if empty)
+    arduino_jitter: int = 30  # Jitter intensity 0-100
+    arduino_tremor: int = 15  # Tremor intensity 0-100
+    arduino_humanization: bool = True  # Enable micro-humanization
+    
+    # Input blocking - hide button presses from the game
+    input_blocking_enabled: bool = True
+    block_left_click: bool = False
+    block_right_click: bool = False
+    block_middle_click: bool = False
+    block_forward_button: bool = True  # X2 - commonly used as hotkey
+    block_back_button: bool = True     # X1 - commonly used as hotkey
     
     # Sensitivity normalization
     sens_normalization_enabled: bool = True

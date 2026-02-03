@@ -89,7 +89,6 @@ class SectionWidget(QWidget):
             color: #94a3b8;
             font-size: 11px;
             font-weight: 600;
-            letter-spacing: 0.3px;
         """)
         title_row.addWidget(self._title_label)
         title_row.addStretch()

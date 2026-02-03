@@ -6,7 +6,7 @@ Selects the best target from detections based on various criteria
 import math
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
-from .tensorrt_engine import Detection
+from .detection import Detection
 
 
 @dataclass

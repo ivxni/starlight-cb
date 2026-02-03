@@ -18,13 +18,20 @@ class DebugView(QWidget):
         
         self._frame = None
         self._detections = []
-        self._target = None
+        self._aim_target = None
+        self._flick_target = None
         self._aim_fov = 25
+        self._flick_fov = 30
+        self._aim_key_down = False
+        self._flick_key_down = False
+        self._trigger_key_down = False
         
         self._capture_fps = 0.0
         self._detection_fps = 0.0
         self._latency_ms = 0.0
         self._program_latency_ms = 0.0
+        self._frame_age_ms = 0.0
+        self._lifecycle_state = "Idle"
         
         self._setup_ui()
         
@@ -51,8 +58,6 @@ class DebugView(QWidget):
             color: #64748b;
             font-size: 9px;
             font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
             background: transparent;
             border: none;
         """)
@@ -112,6 +117,20 @@ class DebugView(QWidget):
         stats_layout.addWidget(self._stat_label("LAT"), 1, 2)
         self.lat_ms = self._value_label("#eab308")
         stats_layout.addWidget(self.lat_ms, 1, 3)
+
+        # Row 3
+        stats_layout.addWidget(self._stat_label("AGE"), 2, 0)
+        self.age_ms = self._value_label("#eab308")
+        stats_layout.addWidget(self.age_ms, 2, 1)
+
+        stats_layout.addWidget(self._stat_label("STATE"), 2, 2)
+        self.state_lbl = self._value_label("#22c55e")
+        stats_layout.addWidget(self.state_lbl, 2, 3)
+
+        # Row 4
+        stats_layout.addWidget(self._stat_label("DEV"), 3, 0)
+        self.dev_lbl = self._value_label("#22c55e")
+        stats_layout.addWidget(self.dev_lbl, 3, 1)
         
         layout.addWidget(stats)
         
@@ -137,29 +156,50 @@ class DebugView(QWidget):
     
     def update_detections(self, detections: list, target=None):
         self._detections = detections
-        self._target = target
+        # Backward compatibility: old call passes aim target as `target`
+        self._aim_target = target
+    
+    def update_targets(self, aim_target=None, flick_target=None):
+        self._aim_target = aim_target
+        self._flick_target = flick_target
     
     def update_metrics(self, capture_fps: float, detection_fps: float,
-                       latency_ms: float, program_latency_ms: float = 0):
+                       latency_ms: float, program_latency_ms: float = 0,
+                       frame_age_ms: float = 0, lifecycle_state: str = "Idle",
+                       detector_device: str = ""):
         self._capture_fps = capture_fps
         self._detection_fps = detection_fps
         self._latency_ms = latency_ms
         self._program_latency_ms = program_latency_ms
+        self._frame_age_ms = frame_age_ms
+        self._lifecycle_state = lifecycle_state
         
         self.cap_fps.setText(f"{capture_fps:.0f}")
         self.det_fps.setText(f"{detection_fps:.0f}")
         self.inf_ms.setText(f"{latency_ms:.1f}ms")
         self.lat_ms.setText(f"{program_latency_ms:.1f}ms")
+        self.age_ms.setText(f"{frame_age_ms:.1f}ms")
+        self.state_lbl.setText(lifecycle_state)
+        self.dev_lbl.setText(detector_device or "--")
         
-        if capture_fps > 0:
-            self.status.setText("Running")
+        if capture_fps > 0 or lifecycle_state != "Idle":
+            keys = f"A:{int(self._aim_key_down)} F:{int(self._flick_key_down)} T:{int(self._trigger_key_down)}"
+            self.status.setText(f"{lifecycle_state} | {keys}")
             self.status.setStyleSheet("color: #22c55e; font-size: 9px; background: transparent; border: none;")
         else:
             self.status.setText("Idle")
             self.status.setStyleSheet("color: #64748b; font-size: 9px; background: transparent; border: none;")
+
+    def update_key_states(self, aim_down: bool, flick_down: bool, trigger_down: bool):
+        self._aim_key_down = aim_down
+        self._flick_key_down = flick_down
+        self._trigger_key_down = trigger_down
     
     def set_aim_fov(self, fov: int):
         self._aim_fov = fov
+    
+    def set_flick_fov(self, fov: int):
+        self._flick_fov = fov
     
     def _update_display(self):
         if self._frame is None:
@@ -169,19 +209,24 @@ class DebugView(QWidget):
         h, w = display.shape[:2]
         cx, cy = w // 2, h // 2
         
-        # FOV circle
+        # FOV circles (Aim + Flick)
         cv2.circle(display, (cx, cy), self._aim_fov, (139, 92, 246), 1, cv2.LINE_AA)
-        
-        # Crosshair
-        cv2.line(display, (cx - 6, cy), (cx + 6, cy), (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.line(display, (cx, cy - 6), (cx, cy + 6), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(display, (cx, cy), self._flick_fov, (34, 211, 238), 1, cv2.LINE_AA)
         
         # Detections - yellow
         for det in self._detections:
             x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
-            is_target = self._target and det == self._target.detection
-            color = (0, 255, 0) if is_target else (0, 255, 255)
-            thick = 2 if is_target else 1
+            is_aim = bool(self._aim_target and det == self._aim_target.detection)
+            is_flick = bool(self._flick_target and det == self._flick_target.detection)
+            if is_aim:
+                color = (0, 255, 0)       # Aim target = green
+                thick = 2
+            elif is_flick:
+                color = (255, 255, 0)     # Flick target = cyan-ish (BGR)
+                thick = 2
+            else:
+                color = (0, 255, 255)     # Other detections = yellow
+                thick = 1
             cv2.rectangle(display, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
             
             # Aim point
@@ -189,9 +234,12 @@ class DebugView(QWidget):
             cv2.circle(display, (int(aim_x), int(aim_y)), 2, (0, 0, 255), -1, cv2.LINE_AA)
         
         # Target line
-        if self._target:
-            cv2.line(display, (cx, cy), (int(self._target.aim_x), int(self._target.aim_y)),
+        if self._aim_target:
+            cv2.line(display, (cx, cy), (int(self._aim_target.aim_x), int(self._aim_target.aim_y)),
                      (0, 255, 0), 1, cv2.LINE_AA)
+        if self._flick_target:
+            cv2.line(display, (cx, cy), (int(self._flick_target.aim_x), int(self._flick_target.aim_y)),
+                     (255, 255, 0), 1, cv2.LINE_AA)
         
         # Convert to pixmap
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
@@ -199,11 +247,14 @@ class DebugView(QWidget):
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
         
-        # Scale to fit square
-        container_size = min(self.frame_container.width(), self.frame_container.height()) - 4
-        scaled = pixmap.scaled(container_size, container_size,
+        # Scale to fit container while keeping aspect ratio
+        container_w = self.frame_container.width() - 4
+        container_h = self.frame_container.height() - 4
+        
+        # Scale maintaining aspect ratio - no stretching
+        scaled = pixmap.scaled(container_w, container_h,
                                Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
+                               Qt.TransformationMode.FastTransformation)
         
         self.frame_label.setPixmap(scaled)
     

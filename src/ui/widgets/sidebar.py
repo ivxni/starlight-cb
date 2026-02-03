@@ -2,7 +2,7 @@
 Minimal Sidebar - Always expanded with FA icons
 """
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor
 
@@ -17,6 +17,7 @@ class NavItem(QWidget):
         'aim': '◎',       # target/crosshair
         'flick': '⚡',     # lightning
         'humanizer': '☰', # sliders/menu
+        'mouse': '🖱',    # mouse
         'settings': '⚙',  # gear
     }
     
@@ -96,6 +97,8 @@ class Sidebar(QFrame):
     """Simple sidebar - always expanded"""
     
     pageChanged = pyqtSignal(int)
+    exitRequested = pyqtSignal()
+    clearRequested = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -140,7 +143,7 @@ class Sidebar(QFrame):
         
         # Section label
         section = QLabel("MENU")
-        section.setStyleSheet("color: #475569; font-size: 10px; font-weight: 600; letter-spacing: 1px; margin-left: 16px;")
+        section.setStyleSheet("color: #475569; font-size: 10px; font-weight: 600; margin-left: 16px;")
         layout.addWidget(section)
         layout.addSpacing(8)
         
@@ -150,6 +153,7 @@ class Sidebar(QFrame):
             ('aim', 'Aim'),
             ('flick', 'Flick & Trigger'),
             ('humanizer', 'Humanizer'),
+            ('mouse', 'Mouse'),
             ('settings', 'Settings'),
         ]
         
@@ -163,6 +167,53 @@ class Sidebar(QFrame):
         self._current = 0
         
         layout.addStretch()
+        
+        # Clear button
+        clear_btn = QPushButton("🧹 Clear")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setToolTip("Kill zombie processes & clear UDP sockets")
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(59, 130, 246, 0.12);
+                border: 1px solid rgba(59, 130, 246, 0.3);
+                border-radius: 4px;
+                color: #60a5fa;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 6px 10px;
+                margin: 0 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(59, 130, 246, 0.2);
+                border-color: rgba(59, 130, 246, 0.45);
+            }
+        """)
+        clear_btn.clicked.connect(self.clearRequested.emit)
+        layout.addWidget(clear_btn)
+        layout.addSpacing(4)
+        
+        # Exit button
+        exit_btn = QPushButton("Exit")
+        exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        exit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(239, 68, 68, 0.12);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+                border-radius: 4px;
+                color: #f87171;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 6px 10px;
+                margin: 0 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(239, 68, 68, 0.2);
+                border-color: rgba(239, 68, 68, 0.45);
+            }
+        """)
+        exit_btn.clicked.connect(self.exitRequested.emit)
+        layout.addWidget(exit_btn)
+        layout.addSpacing(8)
         
         # Footer
         footer = QLabel("v1.0.0")

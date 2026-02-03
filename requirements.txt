@@ -10,18 +10,24 @@ opencv-python>=4.8.0
 
 # Screen Capture
 mss>=9.0.0
-dxcam>=0.0.5
+bettercam>=1.0.0  # Maintained fork of dxcam with stability fixes
 
 # AI Inference (GPU)
-onnxruntime-gpu>=1.16.0
+onnxruntime-directml>=1.16.0
 
 # TensorRT (optional, for maximum performance)
 # Install CUDA Toolkit 12.x first, then:
 # pip install tensorrt --extra-index-url https://pypi.nvidia.com
 
+# GPU Color Detection (optional)
+# Install based on your CUDA version:
+#   CUDA 11.x: pip install cupy-cuda11x
+#   CUDA 12.x: pip install cupy-cuda12x
+
 # Input Handling
 pynput>=1.7.6
 keyboard>=0.13.5
+pyserial>=3.5  # Arduino HID mouse support
 
 # Windows API
 pywin32>=306

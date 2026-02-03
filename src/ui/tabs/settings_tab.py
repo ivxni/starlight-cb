@@ -5,7 +5,7 @@ Settings Tab - Minimal Design
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QScrollArea, QFrame, QTabWidget,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QPushButton,
+    QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QLineEdit, QPushButton,
     QFileDialog
 )
 from PyQt6.QtCore import Qt
@@ -36,21 +36,18 @@ class CaptureSettings(QWidget):
         layout.setSpacing(10)
         layout.setContentsMargins(0, 0, 10, 0)
         
-        # Capture
-        cap = SectionWidget("Capture")
+        # Capture Source
+        cap = SectionWidget("Capture Source")
         
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Mode"))
-        mode_row.addStretch()
-        self.mode = QComboBox()
-        self.mode.addItems(["DXGI (Recommended)", "MSS"])
-        self.mode.setFixedWidth(140)
-        mode_row.addWidget(self.mode)
-        cap.addLayout(mode_row)
-        
-        self.crop = LabeledToggle("Center Crop")
-        self.crop.setChecked(True)
-        cap.addWidget(self.crop)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Source"))
+        source_row.addStretch()
+        self.source_mode = QComboBox()
+        self.source_mode.addItems(["Screen"])
+        self.source_mode.setFixedWidth(140)
+        self.source_mode.currentTextChanged.connect(self._on_source_change)
+        source_row.addWidget(self.source_mode)
+        cap.addLayout(source_row)
         
         layout.addWidget(cap)
         
@@ -60,23 +57,28 @@ class CaptureSettings(QWidget):
         res_row = QHBoxLayout()
         res_row.addWidget(QLabel("Width"))
         self.width = QSpinBox()
-        self.width.setRange(128, 1920)
+        # allow small crop sizes like 120x120
+        self.width.setRange(32, 3840)
         self.width.setValue(640)
         self.width.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        # If user types out-of-range, clamp instead of reverting to previous value
+        self.width.setCorrectionMode(QAbstractSpinBox.CorrectionMode.CorrectToNearestValue)
+        # Don't emit intermediate value changes while typing
+        self.width.setKeyboardTracking(False)
         self.width.setFixedWidth(70)
-        self.width.setKeyboardTracking(False)  # Only emit when editing finished
-        self.width.valueChanged.connect(self._on_width_changed)
+        self.width.editingFinished.connect(self._on_width_changed)
         res_row.addWidget(self.width)
         
         res_row.addSpacing(10)
         res_row.addWidget(QLabel("Height"))
         self.height = QSpinBox()
-        self.height.setRange(128, 1080)
+        self.height.setRange(32, 2160)
         self.height.setValue(640)
         self.height.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.height.setCorrectionMode(QAbstractSpinBox.CorrectionMode.CorrectToNearestValue)
+        self.height.setKeyboardTracking(False)
         self.height.setFixedWidth(70)
-        self.height.setKeyboardTracking(False)  # Only emit when editing finished
-        self.height.valueChanged.connect(self._on_height_changed)
+        self.height.editingFinished.connect(self._on_height_changed)
         res_row.addWidget(self.height)
         res_row.addStretch()
         res.addLayout(res_row)
@@ -107,7 +109,8 @@ class CaptureSettings(QWidget):
         main.addWidget(scroll)
     
     def _load_config(self):
-        # Block signals to prevent feedback loop
+        # Block signals to prevent feedback loops while populating UI
+        self.source_mode.blockSignals(True)
         self.width.blockSignals(True)
         self.height.blockSignals(True)
         self.max_fps.blockSignals(True)
@@ -115,24 +118,33 @@ class CaptureSettings(QWidget):
         self.dbg_fps.blockSignals(True)
         
         c = self.config.capture
-        self.width.setValue(c.capture_width)
-        self.height.setValue(c.capture_height)
-        self.max_fps.setValue(c.max_fps)
-        self.dbg_scale.setValue(c.debug_scale)
-        self.dbg_fps.setValue(c.debug_max_fps)
+        
+        mode_map = {"screen": "Screen"}
+        self.source_mode.setCurrentText(mode_map.get(c.capture_mode, "Screen"))
+        
+        self.width.setValue(int(c.capture_width))
+        self.height.setValue(int(c.capture_height))
+        self.max_fps.setValue(int(c.max_fps))
+        self.dbg_scale.setValue(float(c.debug_scale))
+        self.dbg_fps.setValue(int(c.debug_max_fps))
         
         # Re-enable signals
+        self.source_mode.blockSignals(False)
         self.width.blockSignals(False)
         self.height.blockSignals(False)
         self.max_fps.blockSignals(False)
         self.dbg_scale.blockSignals(False)
         self.dbg_fps.blockSignals(False)
     
-    def _on_width_changed(self, value: int):
-        self.config.capture.capture_width = value
-    
-    def _on_height_changed(self, value: int):
-        self.config.capture.capture_height = value
+    def _on_source_change(self, text: str):
+        mode_map = {"Screen": "screen", "OBS Virtual Camera": "obs"}
+        self.config.capture.capture_mode = mode_map.get(text, "screen")
+
+    def _on_width_changed(self):
+        self.config.capture.capture_width = int(self.width.value())
+
+    def _on_height_changed(self):
+        self.config.capture.capture_height = int(self.height.value())
 
 
 class DetectionSettings(QWidget):
@@ -155,54 +167,133 @@ class DetectionSettings(QWidget):
         layout.setSpacing(10)
         layout.setContentsMargins(0, 0, 10, 0)
         
-        # Model
-        model = SectionWidget("Model")
+        # Color Detection Section
+        self.color_section = SectionWidget("Color Settings")
         
-        backend_row = QHBoxLayout()
-        backend_row.addWidget(QLabel("Backend"))
-        backend_row.addStretch()
-        self.backend = QComboBox()
-        self.backend.addItems(["TensorRT", "ONNX Runtime"])
-        self.backend.setFixedWidth(120)
-        backend_row.addWidget(self.backend)
-        model.addLayout(backend_row)
+        # Color Preset
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset"))
+        preset_row.addStretch()
+        self.color_preset = QComboBox()
+        self.color_preset.addItems(["purple", "purple2", "purple3", "yellow", "yellow2", "red", "red2", "custom"])
+        self.color_preset.setFixedWidth(100)
+        self.color_preset.currentTextChanged.connect(self._on_preset_change)
+        preset_row.addWidget(self.color_preset)
+        self.color_section.addLayout(preset_row)
+
+        color_device_row = QHBoxLayout()
+        color_device_row.addWidget(QLabel("Device"))
+        color_device_row.addStretch()
+        self.color_device = QComboBox()
+        self.color_device.addItems(["CPU", "GPU"])
+        self.color_device.setFixedWidth(100)
+        self.color_device.currentTextChanged.connect(lambda v: setattr(self.config.detection, 'color_device', v.lower()))
+        color_device_row.addWidget(self.color_device)
+        self.color_section.addLayout(color_device_row)
         
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("File"))
-        self.model_path = QLineEdit()
-        self.model_path.setPlaceholderText("models/model.onnx")
-        self.model_path.textChanged.connect(lambda v: setattr(self.config.detection, 'model_path', v))
-        model_row.addWidget(self.model_path)
-        self.browse = QPushButton("...")
-        self.browse.setFixedWidth(30)
-        self.browse.clicked.connect(self._browse)
-        model_row.addWidget(self.browse)
-        model.addLayout(model_row)
+        # HSV Hue
+        self.color_h_min = SliderWidget("Hue Min", 0, 180, 130)
+        self.color_h_min.valueChanged.connect(lambda v: self._set_custom("color_h_min", int(v)))
+        self.color_section.addWidget(self.color_h_min)
         
-        self.conf = SliderWidget("Confidence", 10, 99, 60, suffix="%")
-        self.conf.valueChanged.connect(lambda v: setattr(self.config.detection, 'confidence_threshold', v / 100))
-        model.addWidget(self.conf)
+        self.color_h_max = SliderWidget("Hue Max", 0, 180, 160)
+        self.color_h_max.valueChanged.connect(lambda v: self._set_custom("color_h_max", int(v)))
+        self.color_section.addWidget(self.color_h_max)
         
-        layout.addWidget(model)
+        # HSV Saturation
+        self.color_s_min = SliderWidget("Sat Min", 0, 255, 100)
+        self.color_s_min.valueChanged.connect(lambda v: self._set_custom("color_s_min", int(v)))
+        self.color_section.addWidget(self.color_s_min)
         
-        # Aim Point
-        aim = SectionWidget("Aim Point")
+        self.color_s_max = SliderWidget("Sat Max", 0, 255, 255)
+        self.color_s_max.valueChanged.connect(lambda v: self._set_custom("color_s_max", int(v)))
+        self.color_section.addWidget(self.color_s_max)
+        
+        # HSV Value
+        self.color_v_min = SliderWidget("Val Min", 0, 255, 100)
+        self.color_v_min.valueChanged.connect(lambda v: self._set_custom("color_v_min", int(v)))
+        self.color_section.addWidget(self.color_v_min)
+        
+        self.color_v_max = SliderWidget("Val Max", 0, 255, 255)
+        self.color_v_max.valueChanged.connect(lambda v: self._set_custom("color_v_max", int(v)))
+        self.color_section.addWidget(self.color_v_max)
+        
+        layout.addWidget(self.color_section)
+        
+        # Color Morphology Section
+        self.morph_section = SectionWidget("Color Filtering")
+        
+        self.blur_enabled = LabeledToggle("Gaussian Blur")
+        self.blur_enabled.setChecked(True)
+        self.blur_enabled.toggled.connect(lambda v: setattr(self.config.detection, 'color_blur_enabled', v))
+        self.morph_section.addWidget(self.blur_enabled)
+        
+        self.blur_size = SliderWidget("Blur Size", 1, 15, 3)
+        self.blur_size.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_blur_size', int(v)))
+        self.morph_section.addWidget(self.blur_size)
+        
+        self.color_dilate = SliderWidget("Dilate", 0, 10, 2)
+        self.color_dilate.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_dilate', int(v)))
+        self.morph_section.addWidget(self.color_dilate)
+        
+        self.color_erode = SliderWidget("Erode", 0, 10, 1)
+        self.color_erode.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_erode', int(v)))
+        self.morph_section.addWidget(self.color_erode)
+        
+        self.color_min_area = SliderWidget("Min Area", 10, 1000, 50, suffix="px")
+        self.color_min_area.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_min_area', int(v)))
+        self.morph_section.addWidget(self.color_min_area)
+        
+        self.color_max_area = SliderWidget("Max Area", 1000, 100000, 50000, suffix="px")
+        self.color_max_area.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_max_area', int(v)))
+        self.morph_section.addWidget(self.color_max_area)
+        
+        layout.addWidget(self.morph_section)
+        
+        # Detection Smoothing Section (Anti-Wobble)
+        self.smooth_section = SectionWidget("Anti-Wobble")
+        
+        self.smoothing_enabled = LabeledToggle("Enable Smoothing")
+        self.smoothing_enabled.setChecked(True)
+        self.smoothing_enabled.toggled.connect(lambda v: setattr(self.config.detection, 'smoothing_enabled', v))
+        self.smooth_section.addWidget(self.smoothing_enabled)
+        
+        self.smoothing_window = SliderWidget("Frame Window", 2, 20, 5)
+        self.smoothing_window.valueChanged.connect(lambda v: setattr(self.config.detection, 'smoothing_window', int(v)))
+        self.smooth_section.addWidget(self.smoothing_window)
+        
+        self.smoothing_outlier = SliderWidget("Outlier Threshold", 10, 150, 50, suffix="px")
+        self.smoothing_outlier.valueChanged.connect(lambda v: setattr(self.config.detection, 'smoothing_outlier', int(v)))
+        self.smooth_section.addWidget(self.smoothing_outlier)
+        
+        self.bbox_smoothing = SliderWidget("BBox EMA", 0.5, 1.0, 0.95, decimals=2)
+        self.bbox_smoothing.valueChanged.connect(lambda v: setattr(self.config.detection, 'bbox_smoothing', v))
+        self.smooth_section.addWidget(self.bbox_smoothing)
+        
+        layout.addWidget(self.smooth_section)
+        
+        # Aim Target Settings
+        aim_section = SectionWidget("Aim Target")
         
         bone_row = QHBoxLayout()
-        bone_row.addWidget(QLabel("Target"))
+        bone_row.addWidget(QLabel("Target Point"))
         bone_row.addStretch()
         self.bone = QComboBox()
         self.bone.addItems(["Top Head", "Upper Head", "Head", "Neck", "Chest"])
         self.bone.setFixedWidth(100)
         self.bone.currentTextChanged.connect(self._on_bone)
         bone_row.addWidget(self.bone)
-        aim.addLayout(bone_row)
+        aim_section.addLayout(bone_row)
         
         self.bone_scale = SliderWidget("Scale", 0.5, 2.0, 1.0, decimals=2)
         self.bone_scale.valueChanged.connect(lambda v: setattr(self.config.detection, 'bone_scale', v))
-        aim.addWidget(self.bone_scale)
+        aim_section.addWidget(self.bone_scale)
         
-        layout.addWidget(aim)
+        self.color_head_offset = SliderWidget("Head Offset", 0.0, 1.0, 0.15, decimals=2)
+        self.color_head_offset.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_head_offset', v))
+        aim_section.addWidget(self.color_head_offset)
+        
+        layout.addWidget(aim_section)
         layout.addStretch()
         
         scroll.setWidget(content)
@@ -211,32 +302,76 @@ class DetectionSettings(QWidget):
         main.addWidget(scroll)
     
     def _load_config(self):
-        # Block signals
-        self.model_path.blockSignals(True)
-        self.conf.blockSignals(True)
-        self.bone_scale.blockSignals(True)
-        self.bone.blockSignals(True)
+        # Block all signals
+        widgets = [
+            self.bone_scale, self.bone,
+            self.color_preset, self.color_device, self.color_h_min, self.color_h_max, self.color_s_min, self.color_s_max,
+            self.color_v_min, self.color_v_max, self.color_dilate, self.color_erode,
+            self.color_min_area, self.color_max_area, self.color_head_offset,
+            self.blur_enabled, self.blur_size, self.smoothing_enabled, self.smoothing_window,
+            self.smoothing_outlier, self.bbox_smoothing
+        ]
+        for w in widgets:
+            w.blockSignals(True)
         
         d = self.config.detection
-        self.model_path.setText(d.model_path)
-        self.conf.setValue(d.confidence_threshold * 100)
-        self.bone_scale.setValue(d.bone_scale)
         
+        # Aim target settings
+        self.bone_scale.setValue(d.bone_scale)
         bone_map = {"top_head": "Top Head", "upper_head": "Upper Head", "head": "Head",
                     "neck": "Neck", "chest": "Chest"}
         self.bone.setCurrentText(bone_map.get(d.aim_bone, "Upper Head"))
         
-        # Unblock signals
-        self.model_path.blockSignals(False)
-        self.conf.blockSignals(False)
-        self.bone_scale.blockSignals(False)
-        self.bone.blockSignals(False)
+        # Color settings
+        self.color_preset.setCurrentText(d.color_preset)
+        self.color_device.setCurrentText("GPU" if d.color_device == "gpu" else "CPU")
+        self.color_h_min.setValue(d.color_h_min)
+        self.color_h_max.setValue(d.color_h_max)
+        self.color_s_min.setValue(d.color_s_min)
+        self.color_s_max.setValue(d.color_s_max)
+        self.color_v_min.setValue(d.color_v_min)
+        self.color_v_max.setValue(d.color_v_max)
+        self.color_dilate.setValue(d.color_dilate)
+        self.color_erode.setValue(d.color_erode)
+        self.color_min_area.setValue(d.color_min_area)
+        self.color_max_area.setValue(d.color_max_area)
+        self.color_head_offset.setValue(d.color_head_offset)
+        
+        # Blur and smoothing
+        self.blur_enabled.setChecked(d.color_blur_enabled)
+        self.blur_size.setValue(d.color_blur_size)
+        self.smoothing_enabled.setChecked(d.smoothing_enabled)
+        self.smoothing_window.setValue(d.smoothing_window)
+        self.smoothing_outlier.setValue(d.smoothing_outlier)
+        self.bbox_smoothing.setValue(d.bbox_smoothing)
+        
+        # Unblock all signals
+        for w in widgets:
+            w.blockSignals(False)
     
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Model", "models",
-                                               "Model Files (*.onnx *.engine *.enc *.onnx.enc)")
-        if path:
-            self.model_path.setText(path)
+    def _on_preset_change(self, text: str):
+        """Handle color preset change"""
+        self.config.detection.color_preset = text
+        
+        # Apply preset values to UI
+        from ...detection.color_detector import COLOR_PRESETS
+        if text in COLOR_PRESETS:
+            preset = COLOR_PRESETS[text]
+            self.color_h_min.setValue(preset["h_min"])
+            self.color_h_max.setValue(preset["h_max"])
+            self.color_s_min.setValue(preset["s_min"])
+            self.color_s_max.setValue(preset["s_max"])
+            self.color_v_min.setValue(preset["v_min"])
+            self.color_v_max.setValue(preset["v_max"])
+    
+    def _set_custom(self, attr: str, value):
+        """Set custom color value and switch to custom preset"""
+        setattr(self.config.detection, attr, value)
+        if self.color_preset.currentText() != "custom":
+            self.color_preset.blockSignals(True)
+            self.color_preset.setCurrentText("custom")
+            self.config.detection.color_preset = "custom"
+            self.color_preset.blockSignals(False)
     
     def _on_bone(self, text):
         bone_map = {"Top Head": "top_head", "Upper Head": "upper_head", "Head": "head",
@@ -276,6 +411,11 @@ class MouseSettings(QWidget):
         dev_row.addWidget(self.device)
         dev.addLayout(dev_row)
         
+        # Info label pointing to Mouse tab
+        info_label = QLabel("Configure button blocking in Mouse tab")
+        info_label.setStyleSheet("color: #64748b; font-size: 9px;")
+        dev.addWidget(info_label)
+        
         layout.addWidget(dev)
         
         # Sensitivity
@@ -293,8 +433,7 @@ class MouseSettings(QWidget):
         self.dpi.setValue(800)
         self.dpi.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.dpi.setFixedWidth(70)
-        self.dpi.setKeyboardTracking(False)
-        self.dpi.valueChanged.connect(self._on_sens)
+        self.dpi.editingFinished.connect(self._on_sens)
         dpi_row.addWidget(self.dpi)
         sens.addLayout(dpi_row)
         
@@ -307,8 +446,7 @@ class MouseSettings(QWidget):
         self.ig_sens.setValue(0.41)
         self.ig_sens.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.ig_sens.setFixedWidth(70)
-        self.ig_sens.setKeyboardTracking(False)
-        self.ig_sens.valueChanged.connect(self._on_sens)
+        self.ig_sens.editingFinished.connect(self._on_sens)
         ig_row.addWidget(self.ig_sens)
         sens.addLayout(ig_row)
         
@@ -321,8 +459,7 @@ class MouseSettings(QWidget):
         self.ref_sens.setValue(0.70)
         self.ref_sens.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.ref_sens.setFixedWidth(70)
-        self.ref_sens.setKeyboardTracking(False)
-        self.ref_sens.valueChanged.connect(self._on_sens)
+        self.ref_sens.editingFinished.connect(self._on_sens)
         ref_row.addWidget(self.ref_sens)
         sens.addLayout(ref_row)
         
@@ -384,7 +521,7 @@ class MouseSettings(QWidget):
         self.flick_delay.blockSignals(False)
         self.sens_mult.blockSignals(False)
     
-    def _on_sens(self, v):
+    def _on_sens(self):
         self.config.mouse.dpi_value = self.dpi.value()
         self.config.mouse.in_game_sens = self.ig_sens.value()
         self.config.mouse.reference_sens = self.ref_sens.value()

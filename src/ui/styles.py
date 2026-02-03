@@ -78,8 +78,6 @@ QGroupBox::title {
     color: #64748b;
     font-size: 10px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
 }
 
 /* ============================================

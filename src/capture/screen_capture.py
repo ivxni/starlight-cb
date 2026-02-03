@@ -1,28 +1,94 @@
 """
 Screen Capture Module
-Uses DXGI Desktop Duplication for low-latency screen capture
+Supports: Screen capture, Window capture, OBS Virtual Camera
 """
 
 import numpy as np
 import cv2
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from collections import deque
 from dataclasses import dataclass
 from threading import Thread, Lock
 import ctypes
+from ctypes import wintypes
 
 try:
-    import dxcam
+    import bettercam as dxcam  # Maintained fork with stability fixes
     DXCAM_AVAILABLE = True
+    print("Using bettercam (stable)")
 except ImportError:
-    DXCAM_AVAILABLE = False
-    print("Warning: dxcam not available, falling back to mss")
+    try:
+        import dxcam  # Fallback to original dxcam
+        DXCAM_AVAILABLE = True
+        print("Using dxcam (original)")
+    except ImportError:
+        DXCAM_AVAILABLE = False
+        print("Warning: bettercam/dxcam not available, falling back to mss")
 
 try:
     import mss
     MSS_AVAILABLE = True
 except ImportError:
     MSS_AVAILABLE = False
+
+# Windows API for window capture
+user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
+
+# Window capture constants
+SRCCOPY = 0x00CC0020
+DIB_RGB_COLORS = 0
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ('biSize', wintypes.DWORD),
+        ('biWidth', wintypes.LONG),
+        ('biHeight', wintypes.LONG),
+        ('biPlanes', wintypes.WORD),
+        ('biBitCount', wintypes.WORD),
+        ('biCompression', wintypes.DWORD),
+        ('biSizeImage', wintypes.DWORD),
+        ('biXPelsPerMeter', wintypes.LONG),
+        ('biYPelsPerMeter', wintypes.LONG),
+        ('biClrUsed', wintypes.DWORD),
+        ('biClrImportant', wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ('bmiHeader', BITMAPINFOHEADER),
+        ('bmiColors', wintypes.DWORD * 3),
+    ]
+
+
+def get_window_list() -> List[Tuple[int, str]]:
+    """Get list of visible windows with titles"""
+    windows = []
+    
+    def enum_callback(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buff = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buff, length + 1)
+                windows.append((hwnd, buff.value))
+        return True
+    
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+    user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+    return windows
+
+
+def find_window_by_name(name: str) -> Optional[int]:
+    """Find window handle by partial name match"""
+    name_lower = name.lower()
+    for hwnd, title in get_window_list():
+        if name_lower in title.lower():
+            return hwnd
+    return None
 
 
 @dataclass
@@ -52,28 +118,38 @@ class CaptureRegion:
 
 class ScreenCapture:
     """
-    High-performance screen capture using DXGI Desktop Duplication
-    Captures a cropped region around screen center for AI processing
+    Multi-mode screen capture supporting:
+    - Screen: DXGI/MSS capture of screen region
+    - Window: Capture specific window
+    - OBS: Capture from OBS Virtual Camera
     """
     
     def __init__(self, capture_width: int = 640, capture_height: int = 640, 
-                 target_fps: int = 240, monitor: int = 0):
+                 target_fps: int = 240, monitor: int = 0,
+                 mode: str = "screen", window_name: str = "", obs_stream_url: str = "",
+                 capture_buffer_size: int = 1, max_frame_age_ms: int = 0):
         """
         Initialize screen capture
         
         Args:
-            capture_width: Width of capture region (centered on screen)
-            capture_height: Height of capture region (centered on screen)
+            capture_width: Width of capture region (centered)
+            capture_height: Height of capture region (centered)
             target_fps: Target capture framerate
             monitor: Monitor index to capture
+            mode: "screen", "window", or "obs"
+            window_name: Window title for window capture mode
         """
         self.capture_width = capture_width
         self.capture_height = capture_height
         self.target_fps = target_fps
         self.monitor_idx = monitor
+        self.mode = mode
+        self.window_name = window_name
+        self.obs_stream_url = obs_stream_url
+        self.capture_buffer_size = max(1, int(capture_buffer_size))
+        self.max_frame_age_ms = max(0, int(max_frame_age_ms))
         
         # Get screen dimensions
-        user32 = ctypes.windll.user32
         self.screen_width = user32.GetSystemMetrics(0)
         self.screen_height = user32.GetSystemMetrics(1)
         
@@ -84,11 +160,19 @@ class ScreenCapture:
         self.camera = None
         self._backend = None
         self._mss = None
+        self._window_hwnd = None
+        self._obs_capture = None
+        
+        # Hybrid capture system - MSS always ready as fallback
+        self._mss_fallback_active: bool = False
+        self._mss_fallback_mss = None  # Dedicated MSS instance for fallback
+        self._dxcam_restarting: bool = False
         
         # Frame buffer
         self._frame: Optional[np.ndarray] = None
         self._frame_lock = Lock()
         self._frame_time: float = 0
+        self._frame_buffer = deque(maxlen=self.capture_buffer_size) if self.capture_buffer_size > 1 else None
         
         # Performance tracking
         self._capture_count: int = 0
@@ -98,6 +182,7 @@ class ScreenCapture:
         # Threading
         self._running: bool = False
         self._capture_thread: Optional[Thread] = None
+        self._restart_thread: Optional[Thread] = None
         
     def _calculate_center_region(self) -> CaptureRegion:
         """Calculate the center crop region"""
@@ -106,10 +191,21 @@ class ScreenCapture:
         return CaptureRegion(left, top, self.capture_width, self.capture_height)
     
     def start(self) -> bool:
-        """Start screen capture"""
+        """Start screen capture based on mode"""
         if self._running:
             return True
-            
+        
+        if self.mode == "window":
+            return self._start_window_capture()
+        elif self.mode == "obs":
+            return self._start_obs_capture()
+        elif self.mode == "obs_stream":
+            return self._start_obs_stream_capture()
+        else:
+            return self._start_screen_capture()
+    
+    def _start_screen_capture(self) -> bool:
+        """Start screen region capture"""
         # Try dxcam first (fastest)
         if DXCAM_AVAILABLE:
             try:
@@ -118,11 +214,12 @@ class ScreenCapture:
                     output_idx=self.monitor_idx,
                     output_color="BGR"
                 )
-                self.camera.start(
-                    region=self.region.to_tuple(),
-                    target_fps=self.target_fps,
-                    video_mode=True
-                )
+                # NOTE:
+                # dxcam's internal frame buffer can be allocated at full output resolution,
+                # and using a small `region` with `video_mode=True` can crash with:
+                #   ValueError: could not broadcast input array from shape (h,w,3) into shape (H,W,3)
+                # We therefore capture full output and crop in our own thread.
+                self.camera.start(target_fps=self.target_fps, video_mode=True)
                 self._backend = "dxcam"
                 self._running = True
                 
@@ -130,7 +227,7 @@ class ScreenCapture:
                 self._capture_thread = Thread(target=self._capture_loop_dxcam, daemon=True)
                 self._capture_thread.start()
                 
-                print(f"Screen capture started (dxcam) - Region: {self.region.to_tuple()}")
+                print(f"Screen capture started (dxcam) - Crop: {self.capture_width}x{self.capture_height}")
                 return True
             except Exception as e:
                 print(f"dxcam failed: {e}")
@@ -155,12 +252,109 @@ class ScreenCapture:
         print("No capture backend available!")
         return False
     
+    def _start_window_capture(self) -> bool:
+        """Start window capture mode"""
+        if not self.window_name:
+            print("Window capture: No window name specified")
+            return False
+        
+        self._window_hwnd = find_window_by_name(self.window_name)
+        if not self._window_hwnd:
+            print(f"Window capture: Window '{self.window_name}' not found")
+            return False
+        
+        self._backend = "window"
+        self._running = True
+        self._capture_thread = Thread(target=self._capture_loop_window, daemon=True)
+        self._capture_thread.start()
+        
+        print(f"Window capture started - '{self.window_name}'")
+        return True
+    
+    def _start_obs_capture(self) -> bool:
+        """Start OBS Virtual Camera capture"""
+        try:
+            # Try to open OBS Virtual Camera
+            # Common device indices for OBS Virtual Camera: 0, 1, 2
+            for idx in range(5):
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    # Check if this is OBS by reading a frame
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        self._obs_capture = cap
+                        self._backend = "obs"
+                        self._running = True
+                        self._capture_thread = Thread(target=self._capture_loop_obs, daemon=True)
+                        self._capture_thread.start()
+                        print(f"OBS Virtual Camera started (device {idx})")
+                        return True
+                cap.release()
+            
+            print("OBS Virtual Camera not found. Make sure OBS is running and Virtual Camera is started.")
+            return False
+        except Exception as e:
+            print(f"OBS capture failed: {e}")
+            return False
+
+    def _start_obs_stream_capture(self) -> bool:
+        """Start capture from an OBS local stream URL (UDP/RTMP/etc)."""
+        if not self.obs_stream_url:
+            print("OBS stream: No URL set")
+            return False
+        
+        url = self.obs_stream_url
+        print(f"OBS stream: Connecting to {url}")
+        print("OBS settings: Container=mpegts, Encoder=mjpeg, Keyframe=0")
+        
+        # Try to open with retry
+        cap = None
+        for attempt in range(3):
+            try:
+                cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+                if cap.isOpened():
+                    # Test read a frame
+                    ret, _ = cap.read()
+                    if ret:
+                        break
+                    cap.release()
+                    cap = None
+            except Exception as e:
+                print(f"OBS stream: Attempt {attempt+1} failed: {e}")
+            
+            if attempt < 2:
+                print(f"OBS stream: Retrying in 1s...")
+                time.sleep(1)
+
+        if cap is None or not cap.isOpened():
+            print(f"OBS stream: Could not connect to {url}")
+            print("Make sure OBS Recording is started BEFORE clicking Start!")
+            if cap:
+                try:
+                    cap.release()
+                except:
+                    pass
+            return False
+
+        # Minimal buffer for lowest latency (MJPEG doesn't need large buffers)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 500)
+
+        self._obs_capture = cap
+        self._backend = "obs_stream"
+        self._running = True
+        self._capture_thread = Thread(target=self._capture_loop_obs_stream, daemon=True)
+        self._capture_thread.start()
+        print(f"OBS stream: Connected successfully")
+        return True
+    
     def stop(self):
         """Stop screen capture"""
         self._running = False
         
         if self._capture_thread:
-            self._capture_thread.join(timeout=1.0)
+            self._capture_thread.join(timeout=2.0)
             self._capture_thread = None
             
         if self.camera:
@@ -171,23 +365,244 @@ class ScreenCapture:
             self.camera = None
             
         if self._mss:
-            self._mss.close()
+            try:
+                self._mss.close()
+            except:
+                pass
             self._mss = None
+        
+        if self._obs_capture:
+            try:
+                # Release multiple times to ensure cleanup
+                self._obs_capture.release()
+                self._obs_capture.release()
+            except:
+                pass
+            self._obs_capture = None
+            # Force garbage collection to release FFmpeg resources
+            import gc
+            gc.collect()
+        
+        self._window_hwnd = None
+        with self._frame_lock:
+            self._frame = None
+            self._frame_time = 0
+            if self._frame_buffer is not None:
+                self._frame_buffer.clear()
             
         print("Screen capture stopped")
     
+    def __del__(self):
+        """Destructor - ensure cleanup"""
+        try:
+            self.stop()
+        except:
+            pass
+    
+    def set_mode(self, mode: str, window_name: str = ""):
+        """Change capture mode"""
+        was_running = self._running
+        if was_running:
+            self.stop()
+        
+        self.mode = mode
+        self.window_name = window_name
+        
+        if was_running:
+            self.start()
+    
+    @staticmethod
+    def get_available_windows() -> List[str]:
+        """Get list of window titles for capture"""
+        return [title for _, title in get_window_list() if len(title) > 3]
+    
     def _capture_loop_dxcam(self):
-        """Capture loop using dxcam"""
+        """
+        Hybrid DXCam capture with instant MSS fallback.
+        - 300ms freeze detection (feels instant)
+        - MSS provides frames while DXCam restarts in background
+        - DirectX device loss detection
+        """
+        import gc
+        
+        # Initialize fallback MSS
+        if MSS_AVAILABLE:
+            self._mss_fallback_mss = mss.mss()
+        
+        last_good_frame = time.perf_counter()
+        restart_count = 0
+        total_restarts = 0
+        
         while self._running:
             try:
-                frame = self.camera.get_latest_frame()
-                if frame is not None:
-                    with self._frame_lock:
-                        self._frame = frame
-                        self._frame_time = time.perf_counter()
-                    self._update_fps()
+                # Create camera if needed
+                if not hasattr(self, 'camera') or self.camera is None:
+                    self._mss_fallback_active = False
+                    self._dxcam_restarting = False
+                    
+                    self.camera = dxcam.create(
+                        device_idx=0,
+                        output_idx=self.monitor_idx,
+                        output_color="BGR"
+                    )
+                    self.camera.start(target_fps=self.target_fps, video_mode=True)
+                    
+                    if total_restarts > 0:
+                        print(f"DXCam recovered (restart #{total_restarts})")
+                    else:
+                        print("DXCam started")
+                    
+                    time.sleep(0.03)  # Brief warmup
+                    last_good_frame = time.perf_counter()
+                    restart_count = 0
+                
+                # Fast frame grab loop
+                while self._running:
+                    # If MSS fallback is active, DXCam is restarting in background
+                    if self._mss_fallback_active:
+                        self._grab_mss_fallback_frame()
+                        time.sleep(0.001)
+                        
+                        # Check if DXCam is back
+                        if not self._dxcam_restarting and self.camera is not None:
+                            self._mss_fallback_active = False
+                            last_good_frame = time.perf_counter()
+                            print("DXCam back online")
+                        continue
+                    
+                    # Normal DXCam capture
+                    try:
+                        frame = self.camera.get_latest_frame()
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # Detect DirectX device loss
+                        if "device" in error_str or "removed" in error_str or "reset" in error_str:
+                            print(f"DirectX device lost: {e}")
+                        else:
+                            print(f"DXCam error: {e}")
+                        self._trigger_background_restart()
+                        continue
+                    
+                    if frame is not None:
+                        last_good_frame = time.perf_counter()
+                        
+                        # Crop and store
+                        frame = self._crop_center(frame)
+                        with self._frame_lock:
+                            self._frame = frame
+                            self._frame_time = time.perf_counter()
+                            if self._frame_buffer is not None:
+                                self._frame_buffer.append((frame, self._frame_time))
+                        self._update_fps()
+                    else:
+                        # No frame - check for stall
+                        time_since_frame = time.perf_counter() - last_good_frame
+                        
+                        # FAST detection: 300ms = feels instant to user
+                        if time_since_frame > 0.3:
+                            print(f"DXCam stall ({time_since_frame:.2f}s) - switching to MSS fallback")
+                            self._trigger_background_restart()
+                            continue
+                        
+                        time.sleep(0.0005)  # 0.5ms sleep
+                        
             except Exception as e:
-                time.sleep(0.001)
+                print(f"DXCam critical error: {e}")
+                self._trigger_background_restart()
+            
+            # If we break out of inner loop without fallback active, do sync restart
+            if not self._mss_fallback_active:
+                self._cleanup_dxcam()
+                gc.collect()
+                total_restarts += 1
+                restart_count += 1
+                
+                if restart_count >= 5:
+                    print("DXCam unstable, switching to MSS permanently...")
+                    self._capture_loop_mss()
+                    return
+                
+                time.sleep(0.05)
+    
+    def _trigger_background_restart(self):
+        """Trigger non-blocking DXCam restart while MSS provides frames."""
+        if self._dxcam_restarting:
+            return  # Already restarting
+        
+        self._mss_fallback_active = True
+        self._dxcam_restarting = True
+        
+        # Start background restart thread
+        self._restart_thread = Thread(target=self._restart_dxcam_background, daemon=True)
+        self._restart_thread.start()
+    
+    def _restart_dxcam_background(self):
+        """Restart DXCam in background while MSS handles capture."""
+        import gc
+        
+        try:
+            # Cleanup old camera
+            self._cleanup_dxcam()
+            gc.collect()
+            
+            time.sleep(0.1)  # Brief pause for DirectX to stabilize
+            
+            # Recreate camera
+            self.camera = dxcam.create(
+                device_idx=0,
+                output_idx=self.monitor_idx,
+                output_color="BGR"
+            )
+            self.camera.start(target_fps=self.target_fps, video_mode=True)
+            
+            time.sleep(0.03)  # Brief warmup
+            
+        except Exception as e:
+            print(f"Background restart failed: {e}")
+            self.camera = None
+        finally:
+            self._dxcam_restarting = False
+    
+    def _grab_mss_fallback_frame(self):
+        """Grab a frame using MSS fallback (used while DXCam is restarting)."""
+        if not self._mss_fallback_mss:
+            return
+        
+        try:
+            # Capture full screen and crop (like DXCam does)
+            monitor = self._mss_fallback_mss.monitors[self.monitor_idx + 1]  # mss uses 1-indexed
+            screenshot = self._mss_fallback_mss.grab(monitor)
+            frame = np.array(screenshot)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            
+            # Crop to center
+            frame = self._crop_center(frame)
+            
+            with self._frame_lock:
+                self._frame = frame
+                self._frame_time = time.perf_counter()
+                if self._frame_buffer is not None:
+                    self._frame_buffer.append((frame, self._frame_time))
+            self._update_fps()
+            
+        except Exception as e:
+            pass  # MSS errors are non-fatal
+    
+    def _cleanup_dxcam(self):
+        """Safely cleanup dxcam camera instance."""
+        try:
+            if hasattr(self, 'camera') and self.camera:
+                try:
+                    self.camera.stop()
+                except:
+                    pass
+                try:
+                    del self.camera
+                except:
+                    pass
+        except:
+            pass
+        self.camera = None
     
     def _capture_loop_mss(self):
         """Capture loop using mss"""
@@ -211,6 +626,8 @@ class ScreenCapture:
                 with self._frame_lock:
                     self._frame = frame
                     self._frame_time = time.perf_counter()
+                    if self._frame_buffer is not None:
+                        self._frame_buffer.append((frame, self._frame_time))
                 self._update_fps()
             except Exception as e:
                 pass
@@ -219,6 +636,202 @@ class ScreenCapture:
             elapsed = time.perf_counter() - start
             if elapsed < target_interval:
                 time.sleep(target_interval - elapsed)
+    
+    def _capture_loop_window(self):
+        """Capture loop for window capture"""
+        target_interval = 1.0 / self.target_fps
+        
+        while self._running:
+            start = time.perf_counter()
+            try:
+                frame = self._capture_window()
+                if frame is not None:
+                    # Crop to center region
+                    frame = self._crop_center(frame)
+                    
+                    with self._frame_lock:
+                        self._frame = frame
+                        self._frame_time = time.perf_counter()
+                        if self._frame_buffer is not None:
+                            self._frame_buffer.append((frame, self._frame_time))
+                    self._update_fps()
+            except Exception as e:
+                pass
+            
+            elapsed = time.perf_counter() - start
+            if elapsed < target_interval:
+                time.sleep(target_interval - elapsed)
+    
+    def _capture_window(self) -> Optional[np.ndarray]:
+        """Capture window content using Windows GDI"""
+        if not self._window_hwnd:
+            return None
+        
+        try:
+            # Get window dimensions
+            rect = wintypes.RECT()
+            user32.GetClientRect(self._window_hwnd, ctypes.byref(rect))
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            
+            if width <= 0 or height <= 0:
+                return None
+            
+            # Get device contexts
+            hwnd_dc = user32.GetDC(self._window_hwnd)
+            mfc_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+            bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+            gdi32.SelectObject(mfc_dc, bitmap)
+            
+            # Capture
+            result = ctypes.windll.user32.PrintWindow(self._window_hwnd, mfc_dc, 2)
+            
+            if result:
+                # Get bitmap data
+                bmi = BITMAPINFO()
+                bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.bmiHeader.biWidth = width
+                bmi.bmiHeader.biHeight = -height  # Top-down
+                bmi.bmiHeader.biPlanes = 1
+                bmi.bmiHeader.biBitCount = 32
+                bmi.bmiHeader.biCompression = 0
+                
+                buffer = (ctypes.c_char * (width * height * 4))()
+                gdi32.GetDIBits(mfc_dc, bitmap, 0, height, buffer, ctypes.byref(bmi), DIB_RGB_COLORS)
+                
+                # Convert to numpy array
+                img = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            else:
+                frame = None
+            
+            # Cleanup
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(mfc_dc)
+            user32.ReleaseDC(self._window_hwnd, hwnd_dc)
+            
+            return frame
+        except Exception as e:
+            return None
+    
+    def _capture_loop_obs(self):
+        """Capture loop for OBS Virtual Camera"""
+        frame_count = 0
+        while self._running:
+            try:
+                ret, frame = self._obs_capture.read()
+                if ret and frame is not None:
+                    # Debug: print original size once
+                    if frame_count == 0:
+                        print(f"OBS frame size: {frame.shape[1]}x{frame.shape[0]}")
+                    
+                    # Crop to center region - no stretching
+                    cropped = self._crop_center(frame)
+                    
+                    # Debug: print cropped size once
+                    if frame_count == 0:
+                        print(f"Cropped size: {cropped.shape[1]}x{cropped.shape[0]}")
+                        frame_count = 1
+                    
+                    with self._frame_lock:
+                        self._frame = cropped
+                        self._frame_time = time.perf_counter()
+                        if self._frame_buffer is not None:
+                            self._frame_buffer.append((cropped, self._frame_time))
+                    self._update_fps()
+            except Exception as e:
+                pass
+            time.sleep(0.001)
+
+    def _capture_loop_obs_stream(self):
+        """Capture loop for OBS stream URL (UDP/RTMP/etc) - optimized for MJPEG."""
+        frame_count = 0
+        consecutive_fails = 0
+        last_frame_time = time.perf_counter()
+        
+        while self._running:
+            try:
+                # For MJPEG: use direct read() - each frame is independent
+                ret, frame = self._obs_capture.read()
+                
+                if not ret or frame is None:
+                    consecutive_fails += 1
+                    
+                    # After many fails, try to reconnect
+                    if consecutive_fails > 500:
+                        print("OBS stream: Too many failed reads, attempting reconnect...")
+                        try:
+                            self._obs_capture.release()
+                            time.sleep(0.5)
+                            self._obs_capture = cv2.VideoCapture(self.obs_stream_url, cv2.CAP_FFMPEG)
+                            self._obs_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            consecutive_fails = 0
+                            print("OBS stream: Reconnected")
+                        except Exception as e:
+                            print(f"OBS stream: Reconnect failed: {e}")
+                    
+                    # Adaptive sleep based on failure count
+                    if consecutive_fails > 100:
+                        time.sleep(0.01)
+                    elif consecutive_fails > 10:
+                        time.sleep(0.002)
+                    continue
+                
+                consecutive_fails = 0
+                now = time.perf_counter()
+                
+                # Log first frame and periodic health
+                if frame_count == 0:
+                    print(f"OBS stream: First frame received - {frame.shape[1]}x{frame.shape[0]}")
+                elif frame_count == 100:
+                    fps = 100 / (now - last_frame_time) if (now - last_frame_time) > 0 else 0
+                    print(f"OBS stream: Healthy - ~{fps:.0f} FPS")
+                
+                # Crop to center region
+                cropped = self._crop_center(frame)
+                
+                if frame_count == 0:
+                    print(f"OBS stream: Crop size - {cropped.shape[1]}x{cropped.shape[0]}")
+                
+                frame_count += 1
+                if frame_count == 1:
+                    last_frame_time = now
+                
+                with self._frame_lock:
+                    self._frame = cropped
+                    self._frame_time = now
+                    if self._frame_buffer is not None:
+                        self._frame_buffer.append((cropped, now))
+                
+                self._update_fps()
+                
+            except Exception as e:
+                if frame_count == 0:
+                    print(f"OBS stream error: {e}")
+                time.sleep(0.001)
+    
+    def _crop_center(self, frame: np.ndarray) -> np.ndarray:
+        """Crop frame to center region of specified size - NO resizing/stretching"""
+        h, w = frame.shape[:2]
+        
+        # If frame is smaller than crop size, just return it as-is
+        if w <= self.capture_width and h <= self.capture_height:
+            return frame
+        
+        # Calculate center crop coordinates
+        left = max(0, (w - self.capture_width) // 2)
+        top = max(0, (h - self.capture_height) // 2)
+        right = left + self.capture_width
+        bottom = top + self.capture_height
+        
+        # Ensure we don't go out of bounds
+        right = min(right, w)
+        bottom = min(bottom, h)
+        
+        # Crop without any resizing
+        cropped = frame[top:bottom, left:right]
+        
+        return cropped
     
     def _update_fps(self):
         """Update FPS counter"""
@@ -238,8 +851,16 @@ class ScreenCapture:
             BGR numpy array of shape (height, width, 3) or None
         """
         with self._frame_lock:
-            if self._frame is not None:
-                return self._frame.copy()
+            frame = self._frame
+            ts = self._frame_time
+            if self._frame_buffer is not None and self._frame_buffer:
+                frame, ts = self._frame_buffer[-1]
+            if frame is not None:
+                if self.max_frame_age_ms:
+                    age_ms = (time.perf_counter() - ts) * 1000
+                    if age_ms > self.max_frame_age_ms:
+                        return None
+                return frame.copy()
         return None
     
     def get_frame_with_timestamp(self) -> Tuple[Optional[np.ndarray], float]:
@@ -250,8 +871,16 @@ class ScreenCapture:
             Tuple of (frame, timestamp)
         """
         with self._frame_lock:
-            if self._frame is not None:
-                return self._frame.copy(), self._frame_time
+            frame = self._frame
+            ts = self._frame_time
+            if self._frame_buffer is not None and self._frame_buffer:
+                frame, ts = self._frame_buffer[-1]
+            if frame is not None:
+                if self.max_frame_age_ms:
+                    age_ms = (time.perf_counter() - ts) * 1000
+                    if age_ms > self.max_frame_age_ms:
+                        return None, 0
+                return frame.copy(), ts
         return None, 0
     
     @property

@@ -11,10 +11,13 @@ from typing import Optional, Tuple, Callable
 from dataclasses import dataclass
 
 from ..capture.screen_capture import ScreenCapture
-from ..detection.tensorrt_engine import TensorRTEngine, Detection
+from ..detection.detection import Detection
+from ..detection.color_detector import ColorDetector
 from ..detection.target_selector import TargetSelector, Target
-from ..movement.mouse_controller import MouseController, get_mouse_controller
+from ..movement.mouse_controller import MouseController, get_mouse_controller, configure_mouse_controller
 from ..movement.humanizer import Humanizer
+from ..movement.pid_controller import PIDController
+from ..input.input_blocker import InputBlocker, get_input_blocker
 from .config import Config, get_config
 
 # Windows API for mouse button state
@@ -35,12 +38,19 @@ class AssistantState:
     flick_active: bool = False
     trigger_active: bool = False
     current_target: Optional[Target] = None
+    flick_target: Optional[Target] = None
+    aim_key_down: bool = False
+    flick_key_down: bool = False
+    trigger_key_down: bool = False
+    lifecycle_state: str = "Idle"
     
     # Performance metrics
     capture_fps: float = 0.0
     detection_fps: float = 0.0
     loop_fps: float = 0.0
     latency_ms: float = 0.0
+    frame_age_ms: float = 0.0
+    detector_device: str = ""
 
 
 class Assistant:
@@ -59,11 +69,13 @@ class Assistant:
         
         # Subsystems
         self.capture: Optional[ScreenCapture] = None
-        self.detector: Optional[TensorRTEngine] = None
+        self.detector: Optional[ColorDetector] = None
         self.selector: Optional[TargetSelector] = None
         self.mouse: MouseController = get_mouse_controller()
         self.aim_humanizer: Humanizer = Humanizer()
         self.flick_humanizer: Humanizer = Humanizer()
+        self.input_blocker: InputBlocker = get_input_blocker()
+        self.pid_controller: PIDController = PIDController()
         
         # State
         self.state = AssistantState()
@@ -85,6 +97,7 @@ class Assistant:
         self._loop_count = 0
         self._last_fps_time = 0.0
         self._last_trigger_time = 0.0  # Trigger cooldown
+        self._warmup_frames_left = 0
         
         # Callbacks for UI updates
         self.on_state_change: Optional[Callable[[AssistantState], None]] = None
@@ -93,26 +106,22 @@ class Assistant:
     def initialize(self) -> bool:
         """Initialize all subsystems"""
         try:
+            self.state.lifecycle_state = "Initializing"
             # Initialize screen capture
             self.capture = ScreenCapture(
                 capture_width=self.config.capture.capture_width,
                 capture_height=self.config.capture.capture_height,
                 target_fps=self.config.capture.max_fps,
-                monitor=self.config.capture.monitor
+                monitor=self.config.capture.monitor,
+                mode=self.config.capture.capture_mode,
+                window_name=self.config.capture.window_name,
+                obs_stream_url=getattr(self.config.capture, "obs_stream_url", ""),
+                capture_buffer_size=getattr(self.config.capture, "capture_buffer_size", 1),
+                max_frame_age_ms=getattr(self.config.capture, "max_frame_age_ms", 0)
             )
             
-            # Initialize detector (only if model exists)
-            try:
-                self.detector = TensorRTEngine(
-                    model_path=self.config.detection.model_path,
-                    confidence_threshold=self.config.detection.confidence_threshold,
-                    use_tensorrt=self.config.detection.use_tensorrt,
-                    input_size=self.config.capture.capture_width
-                )
-            except Exception as e:
-                print(f"Warning: Could not load AI model: {e}")
-                print("Detection will be disabled until a valid model is loaded")
-                self.detector = None
+            # Initialize detector based on mode
+            self._init_detector()
             
             # Initialize target selector
             self.selector = TargetSelector(
@@ -120,7 +129,16 @@ class Assistant:
                 frame_height=self.config.capture.capture_height
             )
             
-            # Configure mouse
+            # Configure mouse device (internal or arduino)
+            self.mouse = configure_mouse_controller(
+                device=self.config.mouse.device,
+                port=self.config.mouse.arduino_port,
+                jitter=self.config.mouse.arduino_jitter,
+                tremor=self.config.mouse.arduino_tremor,
+                humanization=self.config.mouse.arduino_humanization
+            )
+            
+            # Configure mouse sensitivity
             self.mouse.set_sensitivity(
                 dpi=self.config.mouse.dpi_value,
                 in_game=self.config.mouse.in_game_sens,
@@ -132,6 +150,9 @@ class Assistant:
             # Configure humanizers
             self._configure_humanizer(self.aim_humanizer, self.config.humanizer)
             self._configure_humanizer(self.flick_humanizer, self.config.flick_humanizer)
+            
+            # Configure input blocker (hide hotkeys from game)
+            self._configure_input_blocker()
             
             print("Assistant initialized successfully")
             return True
@@ -145,18 +166,92 @@ class Assistant:
         # Use the load_from_config method which handles all settings
         humanizer.load_from_config(config)
     
+    def _configure_mouse_device(self):
+        """Configure mouse device (internal or arduino)"""
+        self.mouse = configure_mouse_controller(
+            device=self.config.mouse.device,
+            port=self.config.mouse.arduino_port,
+            jitter=self.config.mouse.arduino_jitter,
+            tremor=self.config.mouse.arduino_tremor,
+            humanization=self.config.mouse.arduino_humanization
+        )
+        
+        # Also update sensitivity
+        self.mouse.set_sensitivity(
+            dpi=self.config.mouse.dpi_value,
+            in_game=self.config.mouse.in_game_sens,
+            reference=self.config.mouse.reference_sens
+        )
+        self.mouse.normalization_enabled = self.config.mouse.sens_normalization_enabled
+        self.mouse.sens_multiplier = self.config.mouse.sens_multiplier
+        
+        print(f"Mouse device: {self.mouse.device_mode}" + 
+              (f" (Arduino connected)" if self.mouse.arduino_connected else ""))
+    
+    def _configure_input_blocker(self):
+        """Configure input blocker based on config settings"""
+        self.input_blocker.clear_blocked_buttons()
+        
+        if not self.config.mouse.input_blocking_enabled:
+            print("Input blocking: DISABLED")
+            return
+        
+        # Add blocked buttons based on config
+        m = self.config.mouse
+        
+        if m.block_left_click:
+            self.input_blocker.add_blocked_button("left_button")
+        if m.block_right_click:
+            self.input_blocker.add_blocked_button("right_button")
+        if m.block_middle_click:
+            self.input_blocker.add_blocked_button("middle_button")
+        if m.block_forward_button:
+            self.input_blocker.add_blocked_button("forward_button")
+        if m.block_back_button:
+            self.input_blocker.add_blocked_button("back_button")
+        
+        if self.input_blocker._blocked_buttons:
+            print(f"Input blocking: ENABLED for {self.input_blocker._blocked_buttons}")
+        else:
+            print("Input blocking: ENABLED but no buttons selected")
+    
+    def _init_detector(self):
+        """Initialize Color Detector"""
+        self.detector = ColorDetector(config=self.config.detection)
+        print(f"Color Detection - Preset: {self.config.detection.color_preset}")
+        self.state.detector_device = getattr(self.detector, "device_status", "CPU")
+    
+    def reload_detector(self):
+        """Reload detector (call when detection mode changes)"""
+        self._init_detector()
+        print("Detector reloaded")
+    
     def start(self) -> bool:
         """Start the assistant"""
         if self._running:
             return True
         
+        self.state.lifecycle_state = "Initializing"
+        
+        # Reconfigure mouse device (in case settings changed)
+        self._configure_mouse_device()
+        
+        # Reconfigure input blocker
+        self._configure_input_blocker()
+        
         # Start capture
         if not self.capture.start():
             print("Failed to start screen capture")
+            self.state.lifecycle_state = "Idle"
             return False
+        
+        # Start input blocker (if enabled)
+        if self.config.mouse.input_blocking_enabled:
+            self.input_blocker.start()
         
         # Start main loop
         self._running = True
+        self._warmup_frames_left = max(0, int(getattr(self.config.capture, "startup_warmup_frames", 0)))
         self._main_thread = threading.Thread(target=self._main_loop, daemon=True)
         self._main_thread.start()
         
@@ -165,6 +260,7 @@ class Assistant:
     
     def stop(self):
         """Stop the assistant"""
+        self.state.lifecycle_state = "Stopping"
         self._running = False
         
         if self._main_thread:
@@ -173,6 +269,11 @@ class Assistant:
         
         if self.capture:
             self.capture.stop()
+        
+        # Stop input blocker
+        self.input_blocker.stop()
+        
+        self.reset_state()
         
         print("Assistant stopped")
     
@@ -198,15 +299,33 @@ class Assistant:
                 self._check_input_state()
                 
                 # Get frame
-                frame = self.capture.get_frame()
-                if frame is None:
+                frame, frame_ts = self.capture.get_frame_with_timestamp()
+                if frame is None or frame_ts == 0:
                     time.sleep(0.001)
                     continue
+                
+                # Drop stale frames (reduce perceived lag)
+                frame_age_ms = (time.perf_counter() - frame_ts) * 1000
+                self.state.frame_age_ms = frame_age_ms
+                max_age = getattr(self.config.capture, "max_frame_age_ms", 0)
+                if max_age and frame_age_ms > max_age:
+                    continue
+                
+                # Warmup (ignore first frames to stabilize)
+                if self._warmup_frames_left > 0:
+                    self._warmup_frames_left -= 1
+                    self.state.lifecycle_state = "Warmup"
+                    self._update_metrics(start_time)
+                    continue
+                else:
+                    self.state.lifecycle_state = "Running"
                 
                 # Run detection
                 detections = []
                 if self.detector and self.detector.is_loaded:
                     detections = self.detector.detect(frame)
+                    # Refresh device status in case runtime selected a different provider
+                    self.state.detector_device = getattr(self.detector, "device_status", self.state.detector_device)
                     
                     # Callback for visualization
                     if self.on_detection:
@@ -218,10 +337,7 @@ class Assistant:
                     self.config.detection.aim_bone,
                     self.config.detection.bone_scale
                 )
-                self.selector.set_class_filter(
-                    self.config.detection.enabled_classes,
-                    self.config.detection.disabled_classes
-                )
+                # Class filtering removed - not needed for color detection
                 
                 # Update mouse sensitivity (live)
                 self.mouse.set_sensitivity(
@@ -232,9 +348,24 @@ class Assistant:
                 self.mouse.normalization_enabled = self.config.mouse.sens_normalization_enabled
                 self.mouse.sens_multiplier = self.config.mouse.sens_multiplier
                 
-                # Update detector confidence
+                # Update detector settings (live)
                 if self.detector:
-                    self.detector.set_confidence(self.config.detection.confidence_threshold)
+                    self.detector.update_hsv(
+                        self.config.detection.color_h_min,
+                        self.config.detection.color_h_max,
+                        self.config.detection.color_s_min,
+                        self.config.detection.color_s_max,
+                        self.config.detection.color_v_min,
+                        self.config.detection.color_v_max
+                    )
+                    self.detector.update_morphology(
+                        self.config.detection.color_dilate,
+                        self.config.detection.color_erode
+                    )
+                    self.detector.update_area_filter(
+                        self.config.detection.color_min_area,
+                        self.config.detection.color_max_area
+                    )
                 
                 # Update humanizers (live)
                 self._configure_humanizer(self.aim_humanizer, self.config.humanizer)
@@ -267,7 +398,7 @@ class Assistant:
                 time.sleep(0.01)
     
     def _process_aim(self, detections: list):
-        """Process aim assist"""
+        """Process aim assist with Sticky Aim and PID"""
         # Reaction time delay
         if self._aim_start_time == 0:
             self._aim_start_time = time.perf_counter()
@@ -291,6 +422,7 @@ class Assistant:
         if target is None:
             self.state.aim_active = False
             self.state.current_target = None
+            self.pid_controller.reset()
             return
         
         self.state.aim_active = True
@@ -298,6 +430,25 @@ class Assistant:
         
         # Calculate delta
         delta_x, delta_y = self.selector.calculate_delta(target)
+        distance = target.distance_to_crosshair
+        
+        # Determine smoothing based on Sticky Aim (Close/Far)
+        if self.config.aim.sticky_aim_enabled:
+            sticky_zone = self.config.aim.sticky_aim_zone
+            
+            if distance <= sticky_zone:
+                # Close to target - use close smoothing (more responsive)
+                smooth_x = self.config.aim.smooth_x_close
+                smooth_y = self.config.aim.smooth_y_close
+            else:
+                # Far from target - interpolate between close and far
+                t = min(1.0, (distance - sticky_zone) / sticky_zone)
+                smooth_x = self.config.aim.smooth_x_close + t * (self.config.aim.smooth_x_far - self.config.aim.smooth_x_close)
+                smooth_y = self.config.aim.smooth_y_close + t * (self.config.aim.smooth_y_far - self.config.aim.smooth_y_close)
+        else:
+            # Use standard smoothing
+            smooth_x = self.config.aim.smooth_x
+            smooth_y = self.config.aim.smooth_y
         
         # Apply humanization
         if self.config.humanizer.enabled:
@@ -308,7 +459,7 @@ class Assistant:
                 return
             
             # Check proximity pause
-            prox_pause = self.aim_humanizer.should_proximity_pause(target.distance_to_crosshair)
+            prox_pause = self.aim_humanizer.should_proximity_pause(distance)
             if prox_pause:
                 time.sleep(prox_pause / 1000)
                 return
@@ -316,13 +467,28 @@ class Assistant:
             # Humanize movement
             h_dx, h_dy = self.aim_humanizer.humanize_movement(
                 delta_x, delta_y,
-                self.config.aim.smooth_x,
-                self.config.aim.smooth_y
+                smooth_x,
+                smooth_y
             )
         else:
             # Basic smoothing only
-            h_dx = delta_x / max(1.0, self.config.aim.smooth_x)
-            h_dy = delta_y / max(1.0, self.config.aim.smooth_y)
+            h_dx = delta_x / max(1.0, smooth_x)
+            h_dy = delta_y / max(1.0, smooth_y)
+        
+        # Apply PID stabilization
+        if self.config.aim.pid_enabled:
+            # Update PID gains from config
+            self.pid_controller.set_gains(
+                self.config.aim.pid_kp,
+                self.config.aim.pid_ki,
+                self.config.aim.pid_kd
+            )
+            self.pid_controller.activation_distance = self.config.aim.pid_activation_dist
+            
+            # Get PID correction
+            pid_x, pid_y = self.pid_controller.update(delta_x, delta_y)
+            h_dx += pid_x
+            h_dy += pid_y
         
         # Apply tracking deadzone
         if abs(delta_x) < self.config.tracking.tracking_deadzone and \
@@ -345,9 +511,11 @@ class Assistant:
         
         if target is None:
             self.state.flick_active = False
+            self.state.flick_target = None
             return
         
         self.state.flick_active = True
+        self.state.flick_target = target
         
         # Calculate delta
         delta_x, delta_y = self.selector.calculate_delta(target)
@@ -429,8 +597,10 @@ class Assistant:
         self._loop_count += 1
         now = time.perf_counter()
         
-        if now - self._last_fps_time >= 1.0:
-            self.state.loop_fps = self._loop_count / (now - self._last_fps_time)
+        # Update FPS calculation every 100ms for smoother display
+        if now - self._last_fps_time >= 0.1:
+            elapsed = now - self._last_fps_time
+            self.state.loop_fps = self._loop_count / elapsed
             self._loop_count = 0
             self._last_fps_time = now
             
@@ -440,11 +610,34 @@ class Assistant:
             if self.detector:
                 self.state.detection_fps = self.detector.fps
             
-            # Callback
+            # Callback - fires every 100ms now
             if self.on_state_change:
                 self.on_state_change(self.state)
         
         self.state.latency_ms = (now - start_time) * 1000
+
+    def reset_state(self):
+        """Reset internal state and counters"""
+        self.state = AssistantState()
+        self._paused = False
+        self._aim_key_pressed = False
+        self._flick_key_pressed = False
+        self._trigger_key_pressed = False
+        self._aim_start_time = 0.0
+        self._last_trigger_time = 0.0
+        self._loop_count = 0
+        self._last_fps_time = 0.0
+        self._warmup_frames_left = 0
+        
+        self.aim_humanizer.reset()
+        self.flick_humanizer.reset()
+        self.pid_controller.reset()
+        
+        if self.detector and hasattr(self.detector, "reset"):
+            try:
+                self.detector.reset()
+            except Exception:
+                pass
     
     # Input handling
     def set_aim_key_state(self, pressed: bool):
@@ -479,9 +672,6 @@ class Assistant:
                 self.config.detection.bone_scale
             )
         
-        if self.detector:
-            self.detector.set_confidence(self.config.detection.confidence_threshold)
-        
         self.mouse.set_sensitivity(
             dpi=self.config.mouse.dpi_value,
             in_game=self.config.mouse.in_game_sens,
@@ -502,7 +692,7 @@ class Assistant:
         return self._paused
     
     def _check_input_state(self):
-        """Check mouse button states using Windows API"""
+        """Check mouse button states - uses InputBlocker for blocked buttons"""
         # Map config key names to virtual key codes
         key_map = {
             "left_click": VK_LBUTTON,
@@ -512,26 +702,35 @@ class Assistant:
             "back_button": VK_XBUTTON1,
         }
         
+        # Helper to check button state (uses blocker if enabled)
+        def is_button_pressed(button_name: str) -> bool:
+            # Prefer hook state if available (works reliably for X buttons)
+            if self.input_blocker.is_running and self.input_blocker.has_state(button_name):
+                return self.input_blocker.is_button_pressed(button_name)
+            # Otherwise use Windows API
+            vk = key_map.get(button_name, VK_XBUTTON2)
+            return bool(GetAsyncKeyState(vk) & 0x8000)
+        
         # Check aim key
-        aim_vk = key_map.get(self.config.aim.aim_key, VK_XBUTTON2)
-        aim_pressed = bool(GetAsyncKeyState(aim_vk) & 0x8000)
+        aim_pressed = is_button_pressed(self.config.aim.aim_key)
         
         if aim_pressed != self._aim_key_pressed:
             if aim_pressed and not self._aim_key_pressed:
                 self._aim_start_time = 0
                 self.aim_humanizer.reset()
             self._aim_key_pressed = aim_pressed
+        self.state.aim_key_down = self._aim_key_pressed
         
         # Check flick key
-        flick_vk = key_map.get(self.config.flick.flick_key, VK_XBUTTON1)
-        flick_pressed = bool(GetAsyncKeyState(flick_vk) & 0x8000)
+        flick_pressed = is_button_pressed(self.config.flick.flick_key)
         
         if flick_pressed != self._flick_key_pressed:
             if flick_pressed and not self._flick_key_pressed:
                 self.flick_humanizer.reset()
             self._flick_key_pressed = flick_pressed
+        self.state.flick_key_down = self._flick_key_pressed
         
         # Check trigger key
-        trigger_vk = key_map.get(self.config.trigger.trigger_key, VK_XBUTTON1)
-        trigger_pressed = bool(GetAsyncKeyState(trigger_vk) & 0x8000)
+        trigger_pressed = is_button_pressed(self.config.trigger.trigger_key)
         self._trigger_key_pressed = trigger_pressed
+        self.state.trigger_key_down = self._trigger_key_pressed

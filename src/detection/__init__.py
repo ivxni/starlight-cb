@@ -1,3 +1,4 @@
 # Detection module
-from .tensorrt_engine import TensorRTEngine
+from .detection import Detection
+from .color_detector import ColorDetector
 from .target_selector import TargetSelector

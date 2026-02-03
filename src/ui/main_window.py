@@ -15,15 +15,17 @@ from .widgets.debug_view import DebugView
 from .tabs.aim_tab import AimTab
 from .tabs.flick_trigger_tab import FlickTriggerTab
 from .tabs.humanizer_tab import HumanizerTab
+from .tabs.mouse_tab import MouseDeviceTab
 from .tabs.settings_tab import SettingsTab
 from ..core.config import Config, save_config
 from ..core.assistant import Assistant
+from ..core.cleanup import full_cleanup
 
 
 class MainWindow(QMainWindow):
     """Main window - minimal design"""
     
-    TITLES = ["Aim", "Flick & Trigger", "Humanizer", "Settings"]
+    TITLES = ["Aim", "Flick & Trigger", "Humanizer", "Mouse", "Settings"]
     
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
@@ -61,6 +63,8 @@ class MainWindow(QMainWindow):
         # Sidebar
         self.sidebar = Sidebar()
         self.sidebar.pageChanged.connect(self._on_page_change)
+        self.sidebar.exitRequested.connect(self.close)
+        self.sidebar.clearRequested.connect(self._on_clear_processes)
         main_layout.addWidget(self.sidebar)
         
         # Content
@@ -85,6 +89,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(AimTab(self.config))
         self.pages.addWidget(FlickTriggerTab(self.config))
         self.pages.addWidget(HumanizerTab(self.config))
+        self.pages.addWidget(MouseDeviceTab(self.config))
         self.pages.addWidget(SettingsTab(self.config))
         
         body.addWidget(self.pages, stretch=1)
@@ -285,13 +290,22 @@ class MainWindow(QMainWindow):
         
         self.debug_view.update_metrics(
             state.capture_fps, state.detection_fps,
-            inf_ms, state.latency_ms
+            inf_ms, state.latency_ms,
+            state.frame_age_ms, state.lifecycle_state,
+            state.detector_device
         )
         self.debug_view.update_detections(self._last_detections, state.current_target)
+        self.debug_view.update_targets(state.current_target, state.flick_target)
         self.debug_view.set_aim_fov(self.config.aim.aim_fov)
+        self.debug_view.set_flick_fov(self.config.flick.flick_fov)
+        self.debug_view.update_key_states(state.aim_key_down, state.flick_key_down, state.trigger_key_down)
     
     def _on_detection(self, detections):
         self._last_detections = detections
+        # Update debug view immediately with new detections
+        if hasattr(self, 'debug_view'):
+            self.debug_view.update_detections(detections, 
+                self.assistant.state.current_target if self.assistant else None)
     
     def _update_frame(self):
         if self.assistant and self.assistant.capture:
@@ -299,8 +313,51 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 self.debug_view.update_frame(frame)
     
-    def closeEvent(self, event):
-        if self.assistant and self.assistant.is_running:
+    def _on_clear_processes(self):
+        """Clear zombie processes and restart detection"""
+        print("Clearing processes...")
+        
+        # Stop assistant if running
+        was_running = self.assistant and self.assistant.is_running
+        if was_running:
             self.assistant.stop()
+        
+        # Run full cleanup
+        cleared = full_cleanup()
+        
+        # Restart if was running
+        if was_running and self.assistant:
+            import time
+            time.sleep(0.5)  # Brief pause
+            self.assistant.start()
+            print("Detection restarted")
+        
+        print(f"Clear complete: {cleared} items")
+    
+    def closeEvent(self, event):
+        """Clean shutdown - release all resources"""
+        print("Shutting down...")
+        
+        # Stop assistant (includes capture, detector, input blocker)
+        if self.assistant:
+            try:
+                if self.assistant.is_running:
+                    self.assistant.stop()
+                # Explicitly stop capture to release UDP socket
+                if self.assistant.capture:
+                    self.assistant.capture.stop()
+                # Stop input blocker
+                if self.assistant.input_blocker:
+                    self.assistant.input_blocker.stop()
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+        
+        # Save config
         save_config()
+        
+        # Force garbage collection to release FFmpeg/CUDA resources
+        import gc
+        gc.collect()
+        
+        print("Shutdown complete")
         event.accept()
