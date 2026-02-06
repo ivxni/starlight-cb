@@ -34,14 +34,17 @@ try:
     import ctypes
     import importlib.util
     _nvidia_dlls_loaded = []
-    for pkg in ["nvidia.cudnn", "nvidia.cublas", "nvidia.cuda_runtime"]:
+    # Load cuDNN, cuBLAS, CUDA runtime, AND TensorRT DLLs
+    for pkg in ["nvidia.cudnn", "nvidia.cublas", "nvidia.cuda_runtime", "tensorrt_libs"]:
         spec = importlib.util.find_spec(pkg)
         if spec and spec.submodule_search_locations:
-            bin_path = os.path.join(spec.submodule_search_locations[0], "bin")
+            # tensorrt_libs has DLLs in root, others in /bin subfolder
+            bin_path = spec.submodule_search_locations[0]
+            if pkg != "tensorrt_libs":
+                bin_path = os.path.join(bin_path, "bin")
             if os.path.isdir(bin_path):
                 os.add_dll_directory(bin_path)
                 os.environ["PATH"] = bin_path + os.pathsep + os.environ.get("PATH", "")
-                # Force-load key DLLs into process memory
                 for dll_name in os.listdir(bin_path):
                     if dll_name.endswith(".dll"):
                         dll_path = os.path.join(bin_path, dll_name)
@@ -51,7 +54,7 @@ try:
                         except OSError:
                             pass
     if _nvidia_dlls_loaded:
-        print(f"Pre-loaded {len(_nvidia_dlls_loaded)} NVIDIA DLLs (cuDNN/cuBLAS)")
+        print(f"Pre-loaded {len(_nvidia_dlls_loaded)} NVIDIA DLLs (cuDNN/cuBLAS/TensorRT)")
 except Exception as e:
     print(f"NVIDIA DLL pre-load: {e}")
 

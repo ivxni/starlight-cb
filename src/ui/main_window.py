@@ -422,6 +422,12 @@ class MainWindow(QMainWindow):
             self.debug_view.update_key_states(
                 state.aim_key_down, state.flick_key_down, state.trigger_key_down
             )
+            # Pass actual active bone (from checkboxes, not stale aim_bone string)
+            self.debug_view.update_bone_settings(
+                getattr(state, 'active_bone', 'upper_head'),
+                getattr(state, 'bone_scale', 1.0),
+                getattr(self.config.trigger, 'trigger_scale', 50)
+            )
     
     def _on_clear_processes(self):
         """Clear zombie processes and restart detection"""

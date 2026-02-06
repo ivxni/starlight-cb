@@ -38,7 +38,7 @@ class DetectionConfig:
     """AI Detection settings"""
     # Backend Selection
     backend: str = "onnx"  # tensorrt, onnx, openvino
-    onnx_provider: str = "cuda"  # cuda, directml, cpu
+    onnx_provider: str = "tensorrt"  # tensorrt, cuda, directml, cpu
     openvino_device: str = "AUTO"  # AUTO, CPU, GPU, NPU
     onnx_threads: int = 0  # 0 = auto
     

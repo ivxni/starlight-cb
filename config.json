@@ -16,8 +16,8 @@
     "debug_max_fps": 120
   },
   "detection": {
-    "backend": "onnx",
-    "onnx_provider": "directml",
+    "backend": "tensorrt",
+    "onnx_provider": "tensorrt",
     "openvino_device": "AUTO",
     "onnx_threads": 0,
     "model_file": "models/ValorantPurple6p6kImg640.onnx",
@@ -33,7 +33,7 @@
     "bone_head": true,
     "bone_neck": false,
     "bone_upper_chest": false,
-    "bone_chest": true,
+    "bone_chest": false,
     "bone_lower_chest": false,
     "bone_upper_stomach": false,
     "bone_stomach": false,
@@ -89,11 +89,11 @@
   "trigger": {
     "enabled": true,
     "trigger_key": "forward_button",
-    "trigger_scale": 90,
+    "trigger_scale": 100,
     "first_shot_delay_min": 0,
     "first_shot_delay_max": 0,
-    "multi_shot_delay_min": 496,
-    "multi_shot_delay_max": 733
+    "multi_shot_delay_min": 475,
+    "multi_shot_delay_max": 692
   },
   "humanizer": {
     "enabled": false,
@@ -236,7 +236,7 @@
     "clamp_max": 14
   },
   "filtering": {
-    "enemy_color_enabled": false,
+    "enemy_color_enabled": true,
     "enemy_color": "purple",
     "color_shape_filter_enabled": false,
     "color_shape_decay": 150

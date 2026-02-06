@@ -172,26 +172,14 @@ class DetectionSettings(QWidget):
         # ============ Backend & Model Section ============
         backend_section = SectionWidget("Backend & Model")
         
-        # Backend Selection
-        backend_row = QHBoxLayout()
-        backend_row.addWidget(QLabel("Backend"))
-        backend_row.addStretch()
-        self.backend = QComboBox()
-        self.backend.addItems(["TensorRT", "ONNX"])
-        self.backend.setFixedWidth(120)
-        self.backend.setToolTip("TensorRT: NVIDIA GPUs (fastest)\nONNX: All GPUs via DirectML/CUDA")
-        self.backend.currentTextChanged.connect(self._on_backend_change)
-        backend_row.addWidget(self.backend)
-        backend_section.addLayout(backend_row)
-        
-        # GPU Provider Selection (for ONNX backend)
+        # GPU Provider Selection
         provider_row = QHBoxLayout()
         provider_row.addWidget(QLabel("GPU Provider"))
         provider_row.addStretch()
         self.gpu_provider = QComboBox()
-        self.gpu_provider.addItems(["CUDA", "DirectML", "CPU"])
+        self.gpu_provider.addItems(["TensorRT", "CUDA", "DirectML", "CPU"])
         self.gpu_provider.setFixedWidth(120)
-        self.gpu_provider.setToolTip("CUDA: NVIDIA GPUs (fast, needs onnxruntime-gpu)\nDirectML: All GPUs (needs onnxruntime-directml)\nCPU: Fallback")
+        self.gpu_provider.setToolTip("TensorRT: NVIDIA GPUs (fastest, FP16)\nCUDA: NVIDIA GPUs (fast)\nDirectML: All GPUs (needs onnxruntime-directml)\nCPU: Fallback")
         self.gpu_provider.currentTextChanged.connect(self._on_provider_change)
         provider_row.addWidget(self.gpu_provider)
         backend_section.addLayout(provider_row)
@@ -450,7 +438,7 @@ class DetectionSettings(QWidget):
         
         # Block all signals during load
         widgets = [
-            self.backend, self.gpu_provider, self.model_file, self.confidence, self.model_type,
+            self.gpu_provider, self.model_file, self.confidence, self.model_type,
             self.trt_level, self.async_inference, self.use_subprocess,
             self.bone_top_head, self.bone_upper_head, self.bone_head, self.bone_neck,
             self.bone_upper_chest, self.bone_chest, self.bone_lower_chest,
@@ -463,12 +451,8 @@ class DetectionSettings(QWidget):
         for w in widgets:
             w.blockSignals(True)
         
-        # Backend & Model
-        backend_map = {"tensorrt": "TensorRT", "onnx": "ONNX"}
-        self.backend.setCurrentText(backend_map.get(d.backend, "ONNX"))
-        
         # GPU Provider
-        provider_map = {"cuda": "CUDA", "directml": "DirectML", "cpu": "CPU"}
+        provider_map = {"tensorrt": "TensorRT", "cuda": "CUDA", "directml": "DirectML", "cpu": "CPU"}
         self.gpu_provider.setCurrentText(provider_map.get(d.onnx_provider, "CUDA"))
         
         # Find model file in dropdown
@@ -539,15 +523,12 @@ class DetectionSettings(QWidget):
                 if ext in ["onnx", "engine", "enc", "xml"]:
                     self.model_file.addItem(f)
     
-    def _on_backend_change(self, text: str):
-        """Handle backend selection change"""
-        backend_map = {"TensorRT": "tensorrt", "ONNX": "onnx"}
-        self.config.detection.backend = backend_map.get(text, "onnx")
-    
     def _on_provider_change(self, text: str):
         """Handle GPU provider selection change"""
-        provider_map = {"CUDA": "cuda", "DirectML": "directml", "CPU": "cpu"}
+        provider_map = {"TensorRT": "tensorrt", "CUDA": "cuda", "DirectML": "directml", "CPU": "cpu"}
         self.config.detection.onnx_provider = provider_map.get(text, "cuda")
+        # All providers go through ONNX Runtime - keep backend as "onnx"
+        self.config.detection.backend = "onnx"
     
     def _on_model_change(self, text: str):
         """Handle model file selection change"""

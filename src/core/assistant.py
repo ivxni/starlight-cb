@@ -7,6 +7,8 @@ import time
 import threading
 import random
 import ctypes
+import cv2
+import numpy as np
 from typing import Optional, Tuple, Callable
 from dataclasses import dataclass
 
@@ -52,6 +54,8 @@ class AssistantState:
     latency_ms: float = 0.0
     frame_age_ms: float = 0.0
     detector_device: str = ""
+    active_bone: str = "upper_head"
+    bone_scale: float = 1.0
 
 
 class Assistant:
@@ -119,11 +123,8 @@ class Assistant:
             # providers - both DirectML and CUDA create D3D11 devices that break DXGI.
             # Force MSS (GDI-based) capture when any GPU provider is configured.
             onnx_provider = getattr(self.config.detection, 'onnx_provider', 'cuda')
-            is_gpu_provider = onnx_provider in ('cuda', 'directml')
-            needs_mss = (
-                getattr(self.config.detection, 'backend', 'onnx') == 'onnx'
-                and is_gpu_provider
-            )
+            is_gpu_provider = onnx_provider in ('cuda', 'directml', 'tensorrt')
+            needs_mss = is_gpu_provider  # Always force MSS for GPU providers
             if needs_mss:
                 print(f"GPU provider '{onnx_provider}' - using MSS capture (D3D conflict avoidance)")
             
@@ -417,10 +418,11 @@ class Assistant:
                 
                 # Update selector config (live updates)
                 self.selector.set_fov(self.config.aim.aim_fov)
-                self.selector.set_aim_bone(
-                    self._get_enabled_bone(),
-                    self.config.detection.bone_scale
-                )
+                active_bone = self._get_enabled_bone()
+                bone_scale = self.config.detection.bone_scale
+                self.selector.set_aim_bone(active_bone, bone_scale)
+                self.state.active_bone = active_bone
+                self.state.bone_scale = bone_scale
                 
                 # Update class filtering based on config
                 enabled_classes = []
@@ -468,7 +470,7 @@ class Assistant:
                 
                 # Process trigger
                 if self._trigger_key_pressed and self.config.trigger.enabled:
-                    self._process_trigger(detections)
+                    self._process_trigger(detections, frame)
                 else:
                     self.state.trigger_active = False
                 
@@ -633,11 +635,39 @@ class Assistant:
         if self.config.mouse.flick_delay > 0:
             time.sleep(self.config.mouse.flick_delay / 1000)
     
-    def _process_trigger(self, detections: list):
+    # Natural trigger zone sizes per bone (% of detection width/height)
+    # These represent the approximate body part size within the full bbox
+    _BONE_TRIGGER_ZONES = {
+        # Head bones: small, narrow (head ≈ 30% width, 12-15% height of body)
+        "top_head":      (0.25, 0.10),
+        "upper_head":    (0.28, 0.12),
+        "head":          (0.32, 0.15),
+        "neck":          (0.30, 0.10),
+        # Upper torso: medium width
+        "upper_chest":   (0.45, 0.12),
+        "chest":         (0.50, 0.15),
+        "lower_chest":   (0.45, 0.12),
+        # Stomach: medium
+        "upper_stomach": (0.40, 0.10),
+        "stomach":       (0.40, 0.12),
+        "lower_stomach": (0.38, 0.10),
+        # Pelvis
+        "pelvis":        (0.35, 0.10),
+    }
+    
+    def _process_trigger(self, detections: list, frame=None):
         """
-        Process triggerbot - AI-BASED (BOUNDING BOX CHECK)
+        Process triggerbot - AI-BASED (BONE-SPECIFIC ZONE CHECK)
         
-        Checks if crosshair is within any detection's bounding box (scaled by trigger_scale).
+        Each bone has a natural trigger zone size matching the body part:
+        - Head bones → small head-sized zone
+        - Chest bones → wider chest-sized zone
+        - trigger_scale is a multiplier (100 = natural size, 50 = tighter, 150 = looser)
+        
+        This means:
+        - Bone = head → small zone at head, fires only near the head
+        - Bone = chest → wider zone at chest, fires on the torso
+        - No empty space misfires
         
         Reaction Time Logic:
         - If target already on crosshair when you press trigger → INSTANT shot
@@ -649,9 +679,8 @@ class Assistant:
             self._trigger_was_on_color = False
             return
         
-        # Check if crosshair is within any detection's bounding box
-        # trigger_scale determines how much of the bbox to use (percentage)
-        trigger_scale = max(1, min(100, self.config.trigger.trigger_scale))
+        # trigger_scale is a multiplier on bone zone size (100 = natural, 50 = tighter)
+        trigger_scale = max(1, min(200, self.config.trigger.trigger_scale)) / 100.0
         
         # Get crosshair position (center of frame)
         frame_w = self.config.capture.capture_width
@@ -659,20 +688,30 @@ class Assistant:
         crosshair_x = frame_w / 2
         crosshair_y = frame_h / 2
         
+        # Get current bone settings
+        active_bone = self.state.active_bone
+        bone_scale = self.state.bone_scale
+        
+        # Get natural zone size for this bone
+        zone_w_pct, zone_h_pct = self._BONE_TRIGGER_ZONES.get(active_bone, (0.32, 0.15))
+        
         is_on_target = False
         for det in detections:
-            # Calculate scaled bounding box centered on detection
-            center_x = (det.x1 + det.x2) / 2
-            center_y = (det.y1 + det.y2) / 2
-            width = det.x2 - det.x1
-            height = det.y2 - det.y1
+            # Get the bone aim point
+            aim_x, aim_y = det.get_aim_point(active_bone, bone_scale)
             
-            scaled_half_w = (width * trigger_scale / 100) / 2
-            scaled_half_h = (height * trigger_scale / 100) / 2
+            det_height = det.y2 - det.y1
+            det_width = det.x2 - det.x1
             
-            # Check if crosshair is within scaled box
-            if (center_x - scaled_half_w <= crosshair_x <= center_x + scaled_half_w and
-                center_y - scaled_half_h <= crosshair_y <= center_y + scaled_half_h):
+            # Trigger zone = natural bone zone * trigger_scale multiplier
+            trigger_radius_x = (det_width * zone_w_pct * trigger_scale) / 2
+            trigger_radius_y = (det_height * zone_h_pct * trigger_scale) / 2
+            
+            # Elliptical check: is crosshair within the trigger zone?
+            dx = (crosshair_x - aim_x) / max(trigger_radius_x, 1)
+            dy = (crosshair_y - aim_y) / max(trigger_radius_y, 1)
+            
+            if (dx * dx + dy * dy) <= 1.0:
                 is_on_target = True
                 break
         
@@ -752,9 +791,8 @@ class Assistant:
             # Get subsystem FPS
             if self.capture:
                 self.state.capture_fps = self.capture.fps
-            if self.detector and self.detector.avg_inference_time > 0:
-                # Calculate FPS from inference time
-                self.state.detection_fps = 1000.0 / self.detector.avg_inference_time
+            # DET = actual loop iterations/sec (real DPS, not theoretical)
+            self.state.detection_fps = self.state.loop_fps
             
             # Callback - fires every 100ms now
             if self.on_state_change:

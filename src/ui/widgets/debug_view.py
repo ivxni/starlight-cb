@@ -14,6 +14,21 @@ from PyQt6.QtGui import QImage, QPixmap
 class DebugView(QWidget):
     """Minimal debug view - square preview (optimized)"""
     
+    # Same bone zone sizes as assistant.py for consistent debug drawing
+    _BONE_TRIGGER_ZONES = {
+        "top_head":      (0.25, 0.10),
+        "upper_head":    (0.28, 0.12),
+        "head":          (0.32, 0.15),
+        "neck":          (0.30, 0.10),
+        "upper_chest":   (0.45, 0.12),
+        "chest":         (0.50, 0.15),
+        "lower_chest":   (0.45, 0.12),
+        "upper_stomach": (0.40, 0.10),
+        "stomach":       (0.40, 0.12),
+        "lower_stomach": (0.38, 0.10),
+        "pelvis":        (0.35, 0.10),
+    }
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -24,6 +39,9 @@ class DebugView(QWidget):
         self._flick_target = None
         self._aim_fov = 25
         self._flick_fov = 30
+        self._aim_bone = "upper_head"
+        self._bone_scale = 1.0
+        self._trigger_scale = 50  # Trigger zone percentage
         self._aim_key_down = False
         self._flick_key_down = False
         self._trigger_key_down = False
@@ -115,7 +133,7 @@ class DebugView(QWidget):
         self.cap_fps = self._value_label("#22c55e")
         stats_layout.addWidget(self.cap_fps, 0, 1)
         
-        stats_layout.addWidget(self._stat_label("DET"), 0, 2)
+        stats_layout.addWidget(self._stat_label("DPS"), 0, 2)
         self.det_fps = self._value_label("#22c55e")
         stats_layout.addWidget(self.det_fps, 0, 3)
         
@@ -175,6 +193,11 @@ class DebugView(QWidget):
     def update_targets(self, aim_target=None, flick_target=None):
         self._aim_target = aim_target
         self._flick_target = flick_target
+    
+    def update_bone_settings(self, bone: str, scale: float, trigger_scale: int = 50):
+        self._aim_bone = bone
+        self._bone_scale = scale
+        self._trigger_scale = trigger_scale
     
     def update_metrics(self, capture_fps: float, detection_fps: float,
                        latency_ms: float, program_latency_ms: float = 0,
@@ -287,6 +310,29 @@ class DebugView(QWidget):
                     color = (0, 255, 255)
                     thick = 1
                 cv2.rectangle(small, (x1, y1), (x2, y2), color, thick, cv2.LINE_4)
+                
+                # Draw aim bone point (red dot) on every detection
+                aim_px, aim_py = det.get_aim_point(self._aim_bone, self._bone_scale)
+                dot_x = int(aim_px * scale)
+                dot_y = int(aim_py * scale)
+                
+                # Draw trigger zone ellipse around bone point (orange, only if trigger enabled)
+                if self._trigger_enabled:
+                    det_w = det.x2 - det.x1
+                    det_h = det.y2 - det.y1
+                    zone_w_pct, zone_h_pct = self._BONE_TRIGGER_ZONES.get(self._aim_bone, (0.32, 0.15))
+                    ts_mult = self._trigger_scale / 100.0  # trigger_scale as multiplier
+                    tr_rx = max(1, int((det_w * zone_w_pct * ts_mult) / 2 * scale))
+                    tr_ry = max(1, int((det_h * zone_h_pct * ts_mult) / 2 * scale))
+                    cv2.ellipse(small, (dot_x, dot_y), (tr_rx, tr_ry), 0, 0, 360, (0, 140, 255), 1, cv2.LINE_AA)
+                
+                if is_aim or is_flick:
+                    # Active target: larger bright red dot with outline
+                    cv2.circle(small, (dot_x, dot_y), 4, (0, 0, 255), -1, cv2.LINE_AA)
+                    cv2.circle(small, (dot_x, dot_y), 4, (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    # Non-target: smaller red dot
+                    cv2.circle(small, (dot_x, dot_y), 3, (0, 0, 200), -1, cv2.LINE_AA)
                 
                 # Show confidence score and class ID for AI detection
                 conf = getattr(det, 'confidence', 0)
