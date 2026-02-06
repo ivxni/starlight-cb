@@ -12,6 +12,7 @@ from PyQt6.QtGui import QColor
 from .styles import GLASSMORPHISM_STYLESHEET, COLORS
 from .widgets.sidebar import Sidebar
 from .widgets.debug_view import DebugView
+from .widgets.log_console import LogConsole
 from .tabs.aim_tab import AimTab
 from .tabs.flick_trigger_tab import FlickTriggerTab
 from .tabs.humanizer_tab import HumanizerTab
@@ -100,6 +101,11 @@ class MainWindow(QMainWindow):
         body.addWidget(self.debug_view)
         
         content_layout.addLayout(body)
+        
+        # Log console (collapsible, hidden by default)
+        self.log_console = LogConsole()
+        content_layout.addWidget(self.log_console)
+        
         main_layout.addWidget(content, stretch=1)
     
     def _create_header(self) -> QWidget:
@@ -127,6 +133,29 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_text)
         
         layout.addSpacing(8)
+        
+        # Console toggle button
+        self.console_btn = QPushButton("Console")
+        self.console_btn.setFixedSize(70, 28)
+        self.console_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.console_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e1e2e;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                color: #64748b;
+                font-size: 10px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                color: #e2e8f0;
+                border-color: #475569;
+            }
+        """)
+        self.console_btn.clicked.connect(self._toggle_console)
+        layout.addWidget(self.console_btn)
+        
+        layout.addSpacing(4)
         
         # Save button
         self.save_btn = QPushButton("Save")
@@ -215,6 +244,40 @@ class MainWindow(QMainWindow):
             }
         """)
     
+    def _toggle_console(self):
+        """Toggle dev console visibility"""
+        self.log_console.toggle()
+        if self.log_console.is_expanded:
+            self.console_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(139, 92, 246, 0.15);
+                    border: 1px solid #8b5cf6;
+                    border-radius: 4px;
+                    color: #8b5cf6;
+                    font-size: 10px;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    color: #9d6ff8;
+                    border-color: #9d6ff8;
+                }
+            """)
+        else:
+            self.console_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e1e2e;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    color: #64748b;
+                    font-size: 10px;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    color: #e2e8f0;
+                    border-color: #475569;
+                }
+            """)
+    
     def _toggle_assistant(self):
         if self.assistant is None or not self.assistant.is_running:
             self._start_assistant()
@@ -226,7 +289,37 @@ class MainWindow(QMainWindow):
         self.assistant.on_state_change = self._on_state_change
         self.assistant.on_detection = self._on_detection
         
-        if self.assistant.initialize() and self.assistant.start():
+        try:
+            init_ok = self.assistant.initialize()
+        except Exception as e:
+            self.log_console.log(f"Initialize failed: {e}", "error")
+            self.status_text.setText(f"Error: {e}")
+            self.status_text.setStyleSheet("color: #f87171; font-size: 11px;")
+            self.status_dot.setStyleSheet("background-color: #f87171; border-radius: 3px;")
+            # Auto-open console on error
+            if not self.log_console.is_expanded:
+                self._toggle_console()
+            return
+        
+        if not init_ok:
+            self.log_console.log("Failed to initialize assistant (check logs above)", "error")
+            self.status_text.setText("Init Failed")
+            self.status_text.setStyleSheet("color: #f87171; font-size: 11px;")
+            self.status_dot.setStyleSheet("background-color: #f87171; border-radius: 3px;")
+            if not self.log_console.is_expanded:
+                self._toggle_console()
+            return
+        
+        if not self.assistant.start():
+            self.log_console.log("Failed to start assistant (capture error?)", "error")
+            self.status_text.setText("Start Failed")
+            self.status_text.setStyleSheet("color: #f87171; font-size: 11px;")
+            self.status_dot.setStyleSheet("background-color: #f87171; border-radius: 3px;")
+            if not self.log_console.is_expanded:
+                self._toggle_console()
+            return
+        
+        if True:
             self.start_btn.setText("Stop")
             self.start_btn.setStyleSheet("""
                 QPushButton {
@@ -250,7 +343,7 @@ class MainWindow(QMainWindow):
             
             self._frame_timer = QTimer()
             self._frame_timer.timeout.connect(self._update_frame)
-            self._frame_timer.start(16)
+            self._frame_timer.start(16)  # ~60fps debug view (GUI thread budget)
     
     def _stop_assistant(self):
         if hasattr(self, '_frame_timer') and self._frame_timer:
@@ -284,34 +377,51 @@ class MainWindow(QMainWindow):
         self.debug_view.update_metrics(0, 0, 0, 0)
     
     def _on_state_change(self, state):
-        inf_ms = 0
-        if self.assistant and self.assistant.detector:
-            inf_ms = self.assistant.detector.inference_time_ms
-        
-        self.debug_view.update_metrics(
-            state.capture_fps, state.detection_fps,
-            inf_ms, state.latency_ms,
-            state.frame_age_ms, state.lifecycle_state,
-            state.detector_device
+        # Called from BACKGROUND thread - only store data, NEVER touch Qt widgets
+        self._pending_state = state
+        self._pending_inf_ms = (
+            self.assistant.detector.inference_time
+            if self.assistant and self.assistant.detector else 0
         )
-        self.debug_view.update_detections(self._last_detections, state.current_target)
-        self.debug_view.update_targets(state.current_target, state.flick_target)
-        self.debug_view.set_aim_fov(self.config.aim.aim_fov)
-        self.debug_view.set_flick_fov(self.config.flick.flick_fov)
-        self.debug_view.update_key_states(state.aim_key_down, state.flick_key_down, state.trigger_key_down)
     
     def _on_detection(self, detections):
+        # Called from BACKGROUND thread - only store data, NEVER touch Qt widgets
         self._last_detections = detections
-        # Update debug view immediately with new detections
-        if hasattr(self, 'debug_view'):
-            self.debug_view.update_detections(detections, 
-                self.assistant.state.current_target if self.assistant else None)
     
     def _update_frame(self):
-        if self.assistant and self.assistant.capture:
-            frame = self.assistant.capture.get_frame()
-            if frame is not None:
-                self.debug_view.update_frame(frame)
+        """GUI-thread timer callback - safe to update all Qt widgets here"""
+        if not self.assistant:
+            return
+        
+        # Apply pending frame
+        if self.assistant.capture:
+            try:
+                frame = self.assistant.capture.get_frame()
+                if frame is not None:
+                    self.debug_view.update_frame(frame.copy())
+            except Exception:
+                pass
+        
+        # Apply pending state (written by background thread, read here on GUI thread)
+        state = getattr(self, '_pending_state', None)
+        if state is not None:
+            inf_ms = getattr(self, '_pending_inf_ms', 0)
+            self.debug_view.update_metrics(
+                state.capture_fps, state.detection_fps,
+                inf_ms, state.latency_ms,
+                state.frame_age_ms, state.lifecycle_state,
+                state.detector_device
+            )
+            self.debug_view.update_detections(self._last_detections, state.current_target)
+            self.debug_view.update_targets(state.current_target, state.flick_target)
+            self.debug_view.set_aim_fov(self.config.aim.aim_fov)
+            self.debug_view.set_flick_fov(self.config.flick.flick_fov)
+            self.debug_view.set_feature_enabled(
+                self.config.aim.enabled, self.config.flick.enabled, self.config.trigger.enabled
+            )
+            self.debug_view.update_key_states(
+                state.aim_key_down, state.flick_key_down, state.trigger_key_down
+            )
     
     def _on_clear_processes(self):
         """Clear zombie processes and restart detection"""
@@ -354,6 +464,10 @@ class MainWindow(QMainWindow):
         
         # Save config
         save_config()
+        
+        # Restore stdout/stderr before exit
+        if hasattr(self, 'log_console'):
+            self.log_console.uninstall_redirects()
         
         # Force garbage collection to release FFmpeg/CUDA resources
         import gc

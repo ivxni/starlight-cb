@@ -127,7 +127,8 @@ class ScreenCapture:
     def __init__(self, capture_width: int = 640, capture_height: int = 640, 
                  target_fps: int = 240, monitor: int = 0,
                  mode: str = "screen", window_name: str = "", obs_stream_url: str = "",
-                 capture_buffer_size: int = 1, max_frame_age_ms: int = 0):
+                 capture_buffer_size: int = 1, max_frame_age_ms: int = 0,
+                 force_mss: bool = False):
         """
         Initialize screen capture
         
@@ -138,7 +139,9 @@ class ScreenCapture:
             monitor: Monitor index to capture
             mode: "screen", "window", or "obs"
             window_name: Window title for window capture mode
+            force_mss: Skip BetterCam/DXCam and use MSS directly (needed when DirectML is active)
         """
+        self.force_mss = force_mss
         self.capture_width = capture_width
         self.capture_height = capture_height
         self.target_fps = target_fps
@@ -206,6 +209,11 @@ class ScreenCapture:
     
     def _start_screen_capture(self) -> bool:
         """Start screen region capture"""
+        # Skip DXCam when DirectML is active (D3D11 conflict)
+        if self.force_mss:
+            print("Using MSS capture (DirectML mode - BetterCam D3D conflict avoided)")
+            return self._start_mss_capture()
+        
         # Try dxcam first (fastest)
         if DXCAM_AVAILABLE:
             try:
@@ -214,26 +222,55 @@ class ScreenCapture:
                     output_idx=self.monitor_idx,
                     output_color="BGR"
                 )
-                # NOTE:
-                # dxcam's internal frame buffer can be allocated at full output resolution,
-                # and using a small `region` with `video_mode=True` can crash with:
-                #   ValueError: could not broadcast input array from shape (h,w,3) into shape (H,W,3)
-                # We therefore capture full output and crop in our own thread.
-                self.camera.start(target_fps=self.target_fps, video_mode=True)
+                # Use region-based capture for better performance
+                # This captures only the center region instead of full screen
+                region = (self.region.left, self.region.top, self.region.right, self.region.bottom)
+                
+                # video_mode=False = on-demand capture (less CPU)
+                # video_mode=True = continuous capture (more CPU, lower latency)
+                # Use False for better game performance
+                self.camera.start(target_fps=self.target_fps, video_mode=False, region=region)
                 self._backend = "dxcam"
                 self._running = True
                 
                 # Start capture thread
-                self._capture_thread = Thread(target=self._capture_loop_dxcam, daemon=True)
+                self._capture_thread = Thread(target=self._capture_loop_dxcam_efficient, daemon=True)
                 self._capture_thread.start()
                 
-                print(f"Screen capture started (dxcam) - Crop: {self.capture_width}x{self.capture_height}")
+                print(f"Screen capture started (dxcam efficient) - Region: {self.capture_width}x{self.capture_height}")
                 return True
             except Exception as e:
-                print(f"dxcam failed: {e}")
-                self.camera = None
+                print(f"dxcam region capture failed: {e}, trying full capture...")
+                # Fallback to full capture with crop
+                try:
+                    if self.camera:
+                        try:
+                            self.camera.stop()
+                        except:
+                            pass
+                    self.camera = dxcam.create(
+                        device_idx=0,
+                        output_idx=self.monitor_idx,
+                        output_color="BGR"
+                    )
+                    self.camera.start(target_fps=self.target_fps, video_mode=False)
+                    self._backend = "dxcam"
+                    self._running = True
+                    
+                    self._capture_thread = Thread(target=self._capture_loop_dxcam, daemon=True)
+                    self._capture_thread.start()
+                    
+                    print(f"Screen capture started (dxcam full+crop) - Crop: {self.capture_width}x{self.capture_height}")
+                    return True
+                except Exception as e2:
+                    print(f"dxcam failed completely: {e2}")
+                    self.camera = None
         
         # Fallback to mss
+        return self._start_mss_capture()
+    
+    def _start_mss_capture(self) -> bool:
+        """Start MSS-based screen capture (GDI, no D3D conflict)"""
         if MSS_AVAILABLE:
             try:
                 self._mss = mss.mss()
@@ -244,7 +281,7 @@ class ScreenCapture:
                 self._capture_thread = Thread(target=self._capture_loop_mss, daemon=True)
                 self._capture_thread.start()
                 
-                print(f"Screen capture started (mss) - Region: {self.region.to_tuple()}")
+                print(f"Screen capture started (mss) - Region: {self.capture_width}x{self.capture_height}")
                 return True
             except Exception as e:
                 print(f"mss failed: {e}")
@@ -416,113 +453,126 @@ class ScreenCapture:
         """Get list of window titles for capture"""
         return [title for _, title in get_window_list() if len(title) > 3]
     
-    def _capture_loop_dxcam(self):
+    def _capture_loop_dxcam_efficient(self):
         """
-        Hybrid DXCam capture with instant MSS fallback.
-        - 300ms freeze detection (feels instant)
-        - MSS provides frames while DXCam restarts in background
-        - DirectX device loss detection
+        Efficient DXCam capture loop - minimal CPU usage.
+        Uses video_mode=False (on-demand capture) for better game performance.
         """
-        import gc
-        
-        # Initialize fallback MSS
-        if MSS_AVAILABLE:
-            self._mss_fallback_mss = mss.mss()
-        
+        target_interval = 1.0 / self.target_fps
         last_good_frame = time.perf_counter()
-        restart_count = 0
-        total_restarts = 0
         
         while self._running:
+            start = time.perf_counter()
+            
             try:
-                # Create camera if needed
-                if not hasattr(self, 'camera') or self.camera is None:
-                    self._mss_fallback_active = False
-                    self._dxcam_restarting = False
+                if self.camera is None:
+                    break
+                
+                # Grab frame on-demand (not continuous)
+                frame = self.camera.grab()
+                
+                if frame is not None:
+                    last_good_frame = time.perf_counter()
                     
+                    # Frame is already cropped to region, no need to crop again
+                    with self._frame_lock:
+                        self._frame = frame
+                        self._frame_time = time.perf_counter()
+                        if self._frame_buffer is not None:
+                            self._frame_buffer.append((frame, self._frame_time))
+                    self._update_fps()
+                else:
+                    # No frame - check for stall
+                    if time.perf_counter() - last_good_frame > 1.0:
+                        print("DXCam stall detected, restarting...")
+                        break
+                        
+            except Exception as e:
+                print(f"DXCam error: {e}")
+                break
+            
+            # Rate limiting - don't capture faster than needed
+            elapsed = time.perf_counter() - start
+            sleep_time = target_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        
+        # Fallback to full capture mode
+        if self._running:
+            print("Falling back to full capture mode...")
+            self._cleanup_dxcam()
+            try:
+                self.camera = dxcam.create(
+                    device_idx=0,
+                    output_idx=self.monitor_idx,
+                    output_color="BGR"
+                )
+                self.camera.start(target_fps=self.target_fps, video_mode=False)
+                self._capture_loop_dxcam()
+            except Exception:
+                print("DXCam failed, switching to MSS...")
+                self._capture_loop_mss()
+    
+    def _capture_loop_dxcam(self):
+        """
+        DXCam capture loop with full screen + crop.
+        Used as fallback when region capture fails.
+        """
+        target_interval = 1.0 / self.target_fps
+        last_good_frame = time.perf_counter()
+        restart_count = 0
+        
+        while self._running:
+            start = time.perf_counter()
+            
+            try:
+                if self.camera is None:
+                    # Try to recreate camera
                     self.camera = dxcam.create(
                         device_idx=0,
                         output_idx=self.monitor_idx,
                         output_color="BGR"
                     )
-                    self.camera.start(target_fps=self.target_fps, video_mode=True)
-                    
-                    if total_restarts > 0:
-                        print(f"DXCam recovered (restart #{total_restarts})")
-                    else:
-                        print("DXCam started")
-                    
-                    time.sleep(0.03)  # Brief warmup
-                    last_good_frame = time.perf_counter()
-                    restart_count = 0
+                    self.camera.start(target_fps=self.target_fps, video_mode=False)
+                    restart_count += 1
+                    if restart_count >= 5:
+                        print("DXCam unstable, switching to MSS...")
+                        self._capture_loop_mss()
+                        return
                 
-                # Fast frame grab loop
-                while self._running:
-                    # If MSS fallback is active, DXCam is restarting in background
-                    if self._mss_fallback_active:
-                        self._grab_mss_fallback_frame()
-                        time.sleep(0.001)
-                        
-                        # Check if DXCam is back
-                        if not self._dxcam_restarting and self.camera is not None:
-                            self._mss_fallback_active = False
-                            last_good_frame = time.perf_counter()
-                            print("DXCam back online")
-                        continue
+                # Grab frame on-demand
+                frame = self.camera.grab()
+                
+                if frame is not None:
+                    last_good_frame = time.perf_counter()
                     
-                    # Normal DXCam capture
-                    try:
-                        frame = self.camera.get_latest_frame()
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        # Detect DirectX device loss
-                        if "device" in error_str or "removed" in error_str or "reset" in error_str:
-                            print(f"DirectX device lost: {e}")
-                        else:
-                            print(f"DXCam error: {e}")
-                        self._trigger_background_restart()
-                        continue
+                    # Crop to center region
+                    frame = self._crop_center(frame)
                     
-                    if frame is not None:
-                        last_good_frame = time.perf_counter()
-                        
-                        # Crop and store
-                        frame = self._crop_center(frame)
-                        with self._frame_lock:
-                            self._frame = frame
-                            self._frame_time = time.perf_counter()
-                            if self._frame_buffer is not None:
-                                self._frame_buffer.append((frame, self._frame_time))
-                        self._update_fps()
-                    else:
-                        # No frame - check for stall
-                        time_since_frame = time.perf_counter() - last_good_frame
-                        
-                        # FAST detection: 300ms = feels instant to user
-                        if time_since_frame > 0.3:
-                            print(f"DXCam stall ({time_since_frame:.2f}s) - switching to MSS fallback")
-                            self._trigger_background_restart()
-                            continue
-                        
-                        time.sleep(0.0005)  # 0.5ms sleep
+                    with self._frame_lock:
+                        self._frame = frame
+                        self._frame_time = time.perf_counter()
+                        if self._frame_buffer is not None:
+                            self._frame_buffer.append((frame, self._frame_time))
+                    self._update_fps()
+                else:
+                    # Check for stall
+                    if time.perf_counter() - last_good_frame > 1.0:
+                        print("DXCam stall, restarting...")
+                        self._cleanup_dxcam()
+                        continue
                         
             except Exception as e:
-                print(f"DXCam critical error: {e}")
-                self._trigger_background_restart()
-            
-            # If we break out of inner loop without fallback active, do sync restart
-            if not self._mss_fallback_active:
+                print(f"DXCam error: {e}")
                 self._cleanup_dxcam()
-                gc.collect()
-                total_restarts += 1
-                restart_count += 1
-                
-                if restart_count >= 5:
-                    print("DXCam unstable, switching to MSS permanently...")
-                    self._capture_loop_mss()
-                    return
-                
-                time.sleep(0.05)
+                time.sleep(0.1)
+                continue
+            
+            # Rate limiting
+            elapsed = time.perf_counter() - start
+            sleep_time = target_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     
     def _trigger_background_restart(self):
         """Trigger non-blocking DXCam restart while MSS provides frames."""
@@ -547,13 +597,13 @@ class ScreenCapture:
             
             time.sleep(0.1)  # Brief pause for DirectX to stabilize
             
-            # Recreate camera
+            # Recreate camera with video_mode=False for efficiency
             self.camera = dxcam.create(
                 device_idx=0,
                 output_idx=self.monitor_idx,
                 output_color="BGR"
             )
-            self.camera.start(target_fps=self.target_fps, video_mode=True)
+            self.camera.start(target_fps=self.target_fps, video_mode=False)
             
             time.sleep(0.03)  # Brief warmup
             
@@ -614,11 +664,23 @@ class ScreenCapture:
         }
         
         target_interval = 1.0 / self.target_fps
+        frame_count = 0
+        error_count = 0
+        
+        # MSS instances are NOT thread-safe - create a new one for this thread
+        try:
+            import mss as _mss
+            thread_mss = _mss.mss()
+        except Exception as e:
+            print(f"MSS thread init failed: {e}")
+            return
+        
+        print(f"MSS capture thread started - monitor region: {monitor}")
         
         while self._running:
             start = time.perf_counter()
             try:
-                screenshot = self._mss.grab(monitor)
+                screenshot = thread_mss.grab(monitor)
                 frame = np.array(screenshot)
                 # Convert BGRA to BGR
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
@@ -629,13 +691,28 @@ class ScreenCapture:
                     if self._frame_buffer is not None:
                         self._frame_buffer.append((frame, self._frame_time))
                 self._update_fps()
+                
+                frame_count += 1
+                if frame_count == 1:
+                    print(f"MSS first frame captured: {frame.shape[1]}x{frame.shape[0]}")
+                    
             except Exception as e:
-                pass
+                error_count += 1
+                if error_count <= 5:
+                    print(f"MSS capture error ({error_count}): {e}")
+                if error_count > 100:
+                    print("MSS too many errors, stopping capture thread")
+                    break
                 
             # Rate limiting
             elapsed = time.perf_counter() - start
             if elapsed < target_interval:
                 time.sleep(target_interval - elapsed)
+        
+        try:
+            thread_mss.close()
+        except:
+            pass
     
     def _capture_loop_window(self):
         """Capture loop for window capture"""

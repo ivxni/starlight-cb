@@ -1,6 +1,7 @@
 """
 Debug View Widget - Minimal Design
 Square preview with stats
+Optimized for performance - no freezing
 """
 
 import numpy as np
@@ -11,12 +12,13 @@ from PyQt6.QtGui import QImage, QPixmap
 
 
 class DebugView(QWidget):
-    """Minimal debug view - square preview"""
+    """Minimal debug view - square preview (optimized)"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
         
         self._frame = None
+        self._frame_dirty = False  # Only redraw when new frame arrives
         self._detections = []
         self._aim_target = None
         self._flick_target = None
@@ -25,6 +27,10 @@ class DebugView(QWidget):
         self._aim_key_down = False
         self._flick_key_down = False
         self._trigger_key_down = False
+        # Feature enabled states
+        self._aim_enabled = True
+        self._flick_enabled = True
+        self._trigger_enabled = True
         
         self._capture_fps = 0.0
         self._detection_fps = 0.0
@@ -33,11 +39,15 @@ class DebugView(QWidget):
         self._frame_age_ms = 0.0
         self._lifecycle_state = "Idle"
         
+        # Performance: only redraw when new frame available
+        # Timer controls max fps, dirty flag prevents redundant draws
+        
         self._setup_ui()
         
+        # Timer at ~120fps for smooth debug display
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_display)
-        self._timer.start(16)
+        self._timer.start(16)  # ~60fps (matches frame timer)
     
     def _setup_ui(self):
         self.setStyleSheet("""
@@ -151,8 +161,11 @@ class DebugView(QWidget):
         return lbl
     
     def update_frame(self, frame: np.ndarray):
+        """Update frame - uses reference, copies only when displaying"""
         if frame is not None:
-            self._frame = frame.copy()
+            # Store reference, don't copy here (copy in _update_display)
+            self._frame = frame
+            self._frame_dirty = True
     
     def update_detections(self, detections: list, target=None):
         self._detections = detections
@@ -183,7 +196,15 @@ class DebugView(QWidget):
         self.dev_lbl.setText(detector_device or "--")
         
         if capture_fps > 0 or lifecycle_state != "Idle":
-            keys = f"A:{int(self._aim_key_down)} F:{int(self._flick_key_down)} T:{int(self._trigger_key_down)}"
+            # Only show key states for enabled features
+            keys_parts = []
+            if self._aim_enabled:
+                keys_parts.append(f"A:{int(self._aim_key_down)}")
+            if self._flick_enabled:
+                keys_parts.append(f"F:{int(self._flick_key_down)}")
+            if self._trigger_enabled:
+                keys_parts.append(f"T:{int(self._trigger_key_down)}")
+            keys = " ".join(keys_parts) if keys_parts else "No features"
             self.status.setText(f"{lifecycle_state} | {keys}")
             self.status.setStyleSheet("color: #22c55e; font-size: 9px; background: transparent; border: none;")
         else:
@@ -201,62 +222,106 @@ class DebugView(QWidget):
     def set_flick_fov(self, fov: int):
         self._flick_fov = fov
     
+    def set_feature_enabled(self, aim: bool, flick: bool, trigger: bool):
+        """Set which features are enabled (only show FOV for enabled features)"""
+        self._aim_enabled = aim
+        self._flick_enabled = flick
+        self._trigger_enabled = trigger
+    
     def _update_display(self):
+        """Update display - heavily optimized to prevent UI freezing"""
         if self._frame is None:
             return
         
-        display = self._frame.copy()
-        h, w = display.shape[:2]
-        cx, cy = w // 2, h // 2
+        # Skip if no new frame available
+        if not self._frame_dirty:
+            return
         
-        # FOV circles (Aim + Flick)
-        cv2.circle(display, (cx, cy), self._aim_fov, (139, 92, 246), 1, cv2.LINE_AA)
-        cv2.circle(display, (cx, cy), self._flick_fov, (34, 211, 238), 1, cv2.LINE_AA)
+        self._frame_dirty = False
         
-        # Detections - yellow
-        for det in self._detections:
-            x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
-            is_aim = bool(self._aim_target and det == self._aim_target.detection)
-            is_flick = bool(self._flick_target and det == self._flick_target.detection)
-            if is_aim:
-                color = (0, 255, 0)       # Aim target = green
-                thick = 2
-            elif is_flick:
-                color = (255, 255, 0)     # Flick target = cyan-ish (BGR)
-                thick = 2
-            else:
-                color = (0, 255, 255)     # Other detections = yellow
-                thick = 1
-            cv2.rectangle(display, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
+        try:
+            # Get target display size (small!)
+            target_size = 240
             
-            # Aim point
-            aim_x, aim_y = det.get_aim_point("upper_head", 1.0)
-            cv2.circle(display, (int(aim_x), int(aim_y)), 2, (0, 0, 255), -1, cv2.LINE_AA)
-        
-        # Target line
-        if self._aim_target:
-            cv2.line(display, (cx, cy), (int(self._aim_target.aim_x), int(self._aim_target.aim_y)),
-                     (0, 255, 0), 1, cv2.LINE_AA)
-        if self._flick_target:
-            cv2.line(display, (cx, cy), (int(self._flick_target.aim_x), int(self._flick_target.aim_y)),
-                     (255, 255, 0), 1, cv2.LINE_AA)
-        
-        # Convert to pixmap
-        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg)
-        
-        # Scale to fit container while keeping aspect ratio
-        container_w = self.frame_container.width() - 4
-        container_h = self.frame_container.height() - 4
-        
-        # Scale maintaining aspect ratio - no stretching
-        scaled = pixmap.scaled(container_w, container_h,
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.FastTransformation)
-        
-        self.frame_label.setPixmap(scaled)
+            # Get original frame dimensions
+            orig_h, orig_w = self._frame.shape[:2]
+            
+            # Calculate scale factor
+            scale = target_size / max(orig_h, orig_w)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            
+            # RESIZE FIRST - much faster to process small image
+            # Use INTER_NEAREST for speed (INTER_LINEAR is slower but smoother)
+            small = cv2.resize(self._frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            
+            # Calculate center and scaled FOV for small image
+            cx, cy = new_w // 2, new_h // 2
+            scaled_aim_fov = int(self._aim_fov * scale)
+            scaled_flick_fov = int(self._flick_fov * scale)
+            
+            # FOV circles - only show if feature is enabled
+            if self._aim_enabled and scaled_aim_fov > 1:
+                cv2.circle(small, (cx, cy), scaled_aim_fov, (139, 92, 246), 1, cv2.LINE_4)
+            if self._flick_enabled and scaled_flick_fov > 1:
+                cv2.circle(small, (cx, cy), scaled_flick_fov, (34, 211, 238), 1, cv2.LINE_4)
+            
+            # Detections - limit to first 5 for performance
+            for det in self._detections[:5]:
+                # Scale detection coordinates
+                x1 = int(det.x1 * scale)
+                y1 = int(det.y1 * scale)
+                x2 = int(det.x2 * scale)
+                y2 = int(det.y2 * scale)
+                
+                is_aim = bool(self._aim_enabled and self._aim_target and det == self._aim_target.detection)
+                is_flick = bool(self._flick_enabled and self._flick_target and det == self._flick_target.detection)
+                
+                if is_aim:
+                    color = (0, 255, 0)
+                    thick = 2
+                elif is_flick:
+                    color = (255, 255, 0)
+                    thick = 2
+                else:
+                    color = (0, 255, 255)
+                    thick = 1
+                cv2.rectangle(small, (x1, y1), (x2, y2), color, thick, cv2.LINE_4)
+                
+                # Show confidence score and class ID for AI detection
+                conf = getattr(det, 'confidence', 0)
+                class_id = getattr(det, 'class_id', 0)
+                if conf > 0:
+                    label = f"C{class_id}:{conf*100:.0f}%"
+                    # Draw label background
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)
+                    cv2.rectangle(small, (x1, y1-th-2), (x1+tw+2, y1), color, -1, cv2.LINE_4)
+                    cv2.putText(small, label, (x1+1, y1-2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1, cv2.LINE_AA)
+            
+            # Target line - scaled
+            if self._aim_enabled and self._aim_target:
+                tx = int(self._aim_target.aim_x * scale)
+                ty = int(self._aim_target.aim_y * scale)
+                cv2.line(small, (cx, cy), (tx, ty), (0, 255, 0), 1, cv2.LINE_4)
+            if self._flick_enabled and self._flick_target:
+                tx = int(self._flick_target.aim_x * scale)
+                ty = int(self._flick_target.aim_y * scale)
+                cv2.line(small, (cx, cy), (tx, ty), (255, 255, 0), 1, cv2.LINE_4)
+            
+            # Convert BGR to RGB - on small image, very fast
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            
+            # Create QImage directly from numpy array
+            qimg = QImage(rgb.data, new_w, new_h, 3 * new_w, QImage.Format.Format_RGB888)
+            
+            # Convert to pixmap - must copy since rgb array will go out of scope
+            pixmap = QPixmap.fromImage(qimg.copy())
+            
+            self.frame_label.setPixmap(pixmap)
+            
+        except Exception:
+            # Silently ignore display errors
+            pass
     
     def start(self):
         if not self._timer.isActive():

@@ -35,61 +35,53 @@ class CaptureConfig:
 
 @dataclass
 class DetectionConfig:
-    """Color detection settings"""
-    # Device
-    color_device: str = "cpu"  # cpu, gpu
+    """AI Detection settings"""
+    # Backend Selection
+    backend: str = "onnx"  # tensorrt, onnx, openvino
+    onnx_provider: str = "cuda"  # cuda, directml, cpu
+    openvino_device: str = "AUTO"  # AUTO, CPU, GPU, NPU
+    onnx_threads: int = 0  # 0 = auto
     
-    # Aim target (still used for where to aim on bounding box)
-    aim_bone: str = "upper_head"  # top_head, upper_head, head, neck, chest, etc.
-    bone_scale: float = 1.0
+    # Model Configuration
+    model_file: str = ""  # Path to .onnx or .engine file
+    confidence: int = 60  # 1-99 (percentage)
+    model_type: str = "object_detection"  # object_detection, pose_estimation
     
-    # Color detection settings
-    color_preset: str = "purple"  # purple, purple2, yellow, yellow2, red, custom
-    color_space: str = "hsv"  # hsv, rgb
+    # Performance Settings
+    trt_optimization: int = 3  # 0-5 (TensorRT optimization level)
+    async_inference: bool = False  # Async inference (higher FPS, more latency)
+    use_subprocess: bool = False  # Run detection in separate process
     
-    # HSV range (used when color_space = hsv)
-    color_h_min: int = 130
-    color_h_max: int = 160
-    color_s_min: int = 100
-    color_s_max: int = 255
-    color_v_min: int = 100
-    color_v_max: int = 255
+    # Aim Bones Configuration
+    aim_bone: str = "upper_head"  # Primary target bone
+    bone_scale: float = 1.0  # Scale factor for bone position (0.5-2.0)
     
-    # RGB range (used when color_space = rgb)
-    color_r_min: int = 162
-    color_r_max: int = 214
-    color_g_min: int = 0
-    color_g_max: int = 104
-    color_b_min: int = 205
-    color_b_max: int = 255
+    # Enabled bones for head targeting
+    bone_top_head: bool = False
+    bone_upper_head: bool = True  # Default enabled
+    bone_head: bool = False
+    bone_neck: bool = False
     
-    # Color differential filters (RGB mode)
-    color_rg_diff: int = 82      # Minimum R-G difference
-    color_bg_diff: int = -255    # Minimum B-G difference
-    color_rb_max_diff: int = 255 # Maximum R-B difference
+    # Enabled bones for torso targeting
+    bone_upper_chest: bool = False
+    bone_chest: bool = False
+    bone_lower_chest: bool = False
+    bone_upper_stomach: bool = False
+    bone_stomach: bool = False
+    bone_lower_stomach: bool = False
+    bone_pelvis: bool = False
     
-    # Color morphological operations
-    color_dilate: int = 2
-    color_erode: int = 1
-    color_closing: bool = False
-    color_closing_size: int = 2
+    # Class Filtering - which classes to prioritize (checked = prioritized)
+    class_filter_0: bool = True   # Usually "enemy" class
+    class_filter_1: bool = False
+    class_filter_2: bool = False
+    class_filter_3: bool = False
     
-    # Gaussian blur pre-processing
-    color_blur_enabled: bool = True
-    color_blur_size: int = 3  # Kernel size (odd number)
-    
-    # Color area filtering
-    color_min_area: int = 50
-    color_max_area: int = 50000
-    
-    # Detection smoothing (Anti-Wobble)
-    smoothing_enabled: bool = True
-    smoothing_window: int = 5       # Frame averaging window
-    smoothing_outlier: int = 50     # Max pixel jump before rejection
-    bbox_smoothing: float = 0.95    # BBox EMA (lower = more smooth)
-    
-    # Color head offset (0.0 = top, 0.5 = center, 1.0 = bottom)
-    color_head_offset: float = 0.15
+    # Disable Classes - which classes to completely ignore
+    class_disable_0: bool = False
+    class_disable_1: bool = True  # Often "teammate" class
+    class_disable_2: bool = False
+    class_disable_3: bool = False
 
 
 @dataclass
@@ -156,14 +148,16 @@ class TriggerConfig:
     enabled: bool = False
     trigger_key: str = "back_button"
     
-    # Detection
-    trigger_scale: int = 24
+    # Detection - trigger scale determines how much of the bounding box
+    # the crosshair must be within to trigger
+    # Lower = stricter (must be near center), Higher = more lenient
+    trigger_scale: int = 50  # Percentage (1-100)
     
     # Timing
     first_shot_delay_min: int = 82
     first_shot_delay_max: int = 124
-    multi_shot_delay_min: int = 40
-    multi_shot_delay_max: int = 45
+    multi_shot_delay_min: int = 170
+    multi_shot_delay_max: int = 210
 
 
 @dataclass
@@ -406,33 +400,41 @@ class Config:
         """Create config from dictionary"""
         config = cls()
         
-        # Load each section
+        def safe_load(dataclass_type, section_data):
+            """Load dataclass with only valid fields (ignores unknown/old fields)"""
+            if not section_data:
+                return dataclass_type()
+            valid_fields = {f.name for f in dataclass_type.__dataclass_fields__.values()}
+            filtered_data = {k: v for k, v in section_data.items() if k in valid_fields}
+            return dataclass_type(**filtered_data)
+        
+        # Load each section (handles old config files with removed fields)
         if 'capture' in data:
-            config.capture = CaptureConfig(**data['capture'])
+            config.capture = safe_load(CaptureConfig, data['capture'])
         if 'detection' in data:
-            config.detection = DetectionConfig(**data['detection'])
+            config.detection = safe_load(DetectionConfig, data['detection'])
         if 'aim' in data:
-            config.aim = AimConfig(**data['aim'])
+            config.aim = safe_load(AimConfig, data['aim'])
         if 'flick' in data:
-            config.flick = FlickConfig(**data['flick'])
+            config.flick = safe_load(FlickConfig, data['flick'])
         if 'trigger' in data:
-            config.trigger = TriggerConfig(**data['trigger'])
+            config.trigger = safe_load(TriggerConfig, data['trigger'])
         if 'humanizer' in data:
-            hum_data = data['humanizer']
+            hum_data = data['humanizer'].copy() if data['humanizer'] else {}
             if 'wind_mouse' in hum_data:
-                hum_data['wind_mouse'] = WindMouseConfig(**hum_data['wind_mouse'])
-            config.humanizer = HumanizerConfig(**hum_data)
+                hum_data['wind_mouse'] = safe_load(WindMouseConfig, hum_data['wind_mouse'])
+            config.humanizer = safe_load(HumanizerConfig, hum_data)
         if 'flick_humanizer' in data:
-            fh_data = data['flick_humanizer']
+            fh_data = data['flick_humanizer'].copy() if data['flick_humanizer'] else {}
             if 'wind_mouse' in fh_data:
-                fh_data['wind_mouse'] = WindMouseConfig(**fh_data['wind_mouse'])
-            config.flick_humanizer = FlickHumanizerConfig(**fh_data)
+                fh_data['wind_mouse'] = safe_load(WindMouseConfig, fh_data['wind_mouse'])
+            config.flick_humanizer = safe_load(FlickHumanizerConfig, fh_data)
         if 'mouse' in data:
-            config.mouse = MouseConfig(**data['mouse'])
+            config.mouse = safe_load(MouseConfig, data['mouse'])
         if 'tracking' in data:
-            config.tracking = TrackingConfig(**data['tracking'])
+            config.tracking = safe_load(TrackingConfig, data['tracking'])
         if 'filtering' in data:
-            config.filtering = FilteringConfig(**data['filtering'])
+            config.filtering = safe_load(FilteringConfig, data['filtering'])
             
         return config
     

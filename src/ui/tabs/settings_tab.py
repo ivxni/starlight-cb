@@ -148,6 +148,8 @@ class CaptureSettings(QWidget):
 
 
 class DetectionSettings(QWidget):
+    """AI Detection Settings - Backend, Model, Bones, Class Filter"""
+    
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.config = config
@@ -167,216 +169,404 @@ class DetectionSettings(QWidget):
         layout.setSpacing(10)
         layout.setContentsMargins(0, 0, 10, 0)
         
-        # Color Detection Section
-        self.color_section = SectionWidget("Color Settings")
+        # ============ Backend & Model Section ============
+        backend_section = SectionWidget("Backend & Model")
         
-        # Color Preset
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("Preset"))
-        preset_row.addStretch()
-        self.color_preset = QComboBox()
-        self.color_preset.addItems(["purple", "purple2", "purple3", "yellow", "yellow2", "red", "red2", "custom"])
-        self.color_preset.setFixedWidth(100)
-        self.color_preset.currentTextChanged.connect(self._on_preset_change)
-        preset_row.addWidget(self.color_preset)
-        self.color_section.addLayout(preset_row)
-
-        color_device_row = QHBoxLayout()
-        color_device_row.addWidget(QLabel("Device"))
-        color_device_row.addStretch()
-        self.color_device = QComboBox()
-        self.color_device.addItems(["CPU", "GPU"])
-        self.color_device.setFixedWidth(100)
-        self.color_device.currentTextChanged.connect(lambda v: setattr(self.config.detection, 'color_device', v.lower()))
-        color_device_row.addWidget(self.color_device)
-        self.color_section.addLayout(color_device_row)
+        # Backend Selection
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Backend"))
+        backend_row.addStretch()
+        self.backend = QComboBox()
+        self.backend.addItems(["TensorRT", "ONNX"])
+        self.backend.setFixedWidth(120)
+        self.backend.setToolTip("TensorRT: NVIDIA GPUs (fastest)\nONNX: All GPUs via DirectML/CUDA")
+        self.backend.currentTextChanged.connect(self._on_backend_change)
+        backend_row.addWidget(self.backend)
+        backend_section.addLayout(backend_row)
         
-        # HSV Hue
-        self.color_h_min = SliderWidget("Hue Min", 0, 180, 130)
-        self.color_h_min.valueChanged.connect(lambda v: self._set_custom("color_h_min", int(v)))
-        self.color_section.addWidget(self.color_h_min)
+        # GPU Provider Selection (for ONNX backend)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("GPU Provider"))
+        provider_row.addStretch()
+        self.gpu_provider = QComboBox()
+        self.gpu_provider.addItems(["CUDA", "DirectML", "CPU"])
+        self.gpu_provider.setFixedWidth(120)
+        self.gpu_provider.setToolTip("CUDA: NVIDIA GPUs (fast, needs onnxruntime-gpu)\nDirectML: All GPUs (needs onnxruntime-directml)\nCPU: Fallback")
+        self.gpu_provider.currentTextChanged.connect(self._on_provider_change)
+        provider_row.addWidget(self.gpu_provider)
+        backend_section.addLayout(provider_row)
         
-        self.color_h_max = SliderWidget("Hue Max", 0, 180, 160)
-        self.color_h_max.valueChanged.connect(lambda v: self._set_custom("color_h_max", int(v)))
-        self.color_section.addWidget(self.color_h_max)
+        # Model File Selection
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model File"))
+        model_row.addStretch()
+        self.model_file = QComboBox()
+        self.model_file.setFixedWidth(200)
+        self.model_file.setToolTip("Select ONNX or TensorRT engine file")
+        self.model_file.currentTextChanged.connect(self._on_model_change)
+        model_row.addWidget(self.model_file)
+        backend_section.addLayout(model_row)
         
-        # HSV Saturation
-        self.color_s_min = SliderWidget("Sat Min", 0, 255, 100)
-        self.color_s_min.valueChanged.connect(lambda v: self._set_custom("color_s_min", int(v)))
-        self.color_section.addWidget(self.color_s_min)
+        # Refresh Models Button
+        refresh_row = QHBoxLayout()
+        refresh_row.addStretch()
+        self.refresh_btn = QPushButton("Refresh Models")
+        self.refresh_btn.setFixedWidth(100)
+        self.refresh_btn.clicked.connect(self._refresh_models)
+        refresh_row.addWidget(self.refresh_btn)
+        backend_section.addLayout(refresh_row)
         
-        self.color_s_max = SliderWidget("Sat Max", 0, 255, 255)
-        self.color_s_max.valueChanged.connect(lambda v: self._set_custom("color_s_max", int(v)))
-        self.color_section.addWidget(self.color_s_max)
+        # Confidence
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("Confidence"))
+        conf_row.addStretch()
+        self.confidence = QComboBox()
+        self.confidence.addItems([str(i) for i in range(10, 100, 5)])
+        self.confidence.setFixedWidth(80)
+        self.confidence.setToolTip("Minimum confidence threshold (1-99%)")
+        self.confidence.currentTextChanged.connect(self._on_confidence_change)
+        conf_row.addWidget(self.confidence)
+        backend_section.addLayout(conf_row)
         
-        # HSV Value
-        self.color_v_min = SliderWidget("Val Min", 0, 255, 100)
-        self.color_v_min.valueChanged.connect(lambda v: self._set_custom("color_v_min", int(v)))
-        self.color_section.addWidget(self.color_v_min)
+        layout.addWidget(backend_section)
         
-        self.color_v_max = SliderWidget("Val Max", 0, 255, 255)
-        self.color_v_max.valueChanged.connect(lambda v: self._set_custom("color_v_max", int(v)))
-        self.color_section.addWidget(self.color_v_max)
+        # ============ Model Settings Section ============
+        model_section = SectionWidget("Model Settings")
         
-        layout.addWidget(self.color_section)
+        # Model Type
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Model Type"))
+        type_row.addStretch()
+        self.model_type = QComboBox()
+        self.model_type.addItems(["Object Detection", "Pose Estimation"])
+        self.model_type.setFixedWidth(140)
+        self.model_type.currentTextChanged.connect(self._on_model_type_change)
+        type_row.addWidget(self.model_type)
+        model_section.addLayout(type_row)
         
-        # Color Morphology Section
-        self.morph_section = SectionWidget("Color Filtering")
+        # TRT Optimization Level
+        trt_row = QHBoxLayout()
+        trt_row.addWidget(QLabel("TRT Optimization"))
+        trt_row.addStretch()
+        self.trt_level = QComboBox()
+        self.trt_level.addItems(["Level " + str(i) for i in range(6)])
+        self.trt_level.setFixedWidth(100)
+        self.trt_level.setToolTip("TensorRT optimization level (higher = faster but longer build)")
+        self.trt_level.currentIndexChanged.connect(lambda i: setattr(self.config.detection, 'trt_optimization', i))
+        trt_row.addWidget(self.trt_level)
+        model_section.addLayout(trt_row)
         
-        self.blur_enabled = LabeledToggle("Gaussian Blur")
-        self.blur_enabled.setChecked(True)
-        self.blur_enabled.toggled.connect(lambda v: setattr(self.config.detection, 'color_blur_enabled', v))
-        self.morph_section.addWidget(self.blur_enabled)
+        # Async Inference Toggle
+        self.async_inference = LabeledToggle("Async Inference Disabled (Lower Latency)")
+        self.async_inference.setToolTip("Async: Higher FPS but more latency\nSync: Lower latency, frame-by-frame")
+        self.async_inference.toggled.connect(lambda v: setattr(self.config.detection, 'async_inference', v))
+        model_section.addWidget(self.async_inference)
         
-        self.blur_size = SliderWidget("Blur Size", 1, 15, 3)
-        self.blur_size.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_blur_size', int(v)))
-        self.morph_section.addWidget(self.blur_size)
+        layout.addWidget(model_section)
         
-        self.color_dilate = SliderWidget("Dilate", 0, 10, 2)
-        self.color_dilate.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_dilate', int(v)))
-        self.morph_section.addWidget(self.color_dilate)
+        # ============ Detector Process Mode ============
+        process_section = SectionWidget("Detector Process Mode")
         
-        self.color_erode = SliderWidget("Erode", 0, 10, 1)
-        self.color_erode.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_erode', int(v)))
-        self.morph_section.addWidget(self.color_erode)
+        self.use_subprocess = LabeledToggle("Use Subprocess")
+        self.use_subprocess.setToolTip("Run detection in separate process\nRequires restart to take effect")
+        self.use_subprocess.toggled.connect(lambda v: setattr(self.config.detection, 'use_subprocess', v))
+        process_section.addWidget(self.use_subprocess)
         
-        self.color_min_area = SliderWidget("Min Area", 10, 1000, 50, suffix="px")
-        self.color_min_area.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_min_area', int(v)))
-        self.morph_section.addWidget(self.color_min_area)
+        subprocess_note = QLabel("Requires restart to take effect")
+        subprocess_note.setStyleSheet("color: #64748b; font-size: 9px;")
+        process_section.addWidget(subprocess_note)
         
-        self.color_max_area = SliderWidget("Max Area", 1000, 100000, 50000, suffix="px")
-        self.color_max_area.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_max_area', int(v)))
-        self.morph_section.addWidget(self.color_max_area)
+        layout.addWidget(process_section)
         
-        layout.addWidget(self.morph_section)
+        # ============ Aim Bones Section ============
+        bones_section = SectionWidget("Aim Bones")
         
-        # Detection Smoothing Section (Anti-Wobble)
-        self.smooth_section = SectionWidget("Anti-Wobble")
+        # Head bones row
+        head_label = QLabel("Head:")
+        head_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        bones_section.addWidget(head_label)
         
-        self.smoothing_enabled = LabeledToggle("Enable Smoothing")
-        self.smoothing_enabled.setChecked(True)
-        self.smoothing_enabled.toggled.connect(lambda v: setattr(self.config.detection, 'smoothing_enabled', v))
-        self.smooth_section.addWidget(self.smoothing_enabled)
+        head_row = QHBoxLayout()
+        self.bone_top_head = LabeledToggle("Top Head")
+        self.bone_top_head.toggled.connect(lambda v: setattr(self.config.detection, 'bone_top_head', v))
+        head_row.addWidget(self.bone_top_head)
         
-        self.smoothing_window = SliderWidget("Frame Window", 2, 20, 5)
-        self.smoothing_window.valueChanged.connect(lambda v: setattr(self.config.detection, 'smoothing_window', int(v)))
-        self.smooth_section.addWidget(self.smoothing_window)
+        self.bone_upper_head = LabeledToggle("Upper Head")
+        self.bone_upper_head.toggled.connect(lambda v: setattr(self.config.detection, 'bone_upper_head', v))
+        head_row.addWidget(self.bone_upper_head)
         
-        self.smoothing_outlier = SliderWidget("Outlier Threshold", 10, 150, 50, suffix="px")
-        self.smoothing_outlier.valueChanged.connect(lambda v: setattr(self.config.detection, 'smoothing_outlier', int(v)))
-        self.smooth_section.addWidget(self.smoothing_outlier)
+        self.bone_head = LabeledToggle("Head")
+        self.bone_head.toggled.connect(lambda v: setattr(self.config.detection, 'bone_head', v))
+        head_row.addWidget(self.bone_head)
         
-        self.bbox_smoothing = SliderWidget("BBox EMA", 0.5, 1.0, 0.95, decimals=2)
-        self.bbox_smoothing.valueChanged.connect(lambda v: setattr(self.config.detection, 'bbox_smoothing', v))
-        self.smooth_section.addWidget(self.bbox_smoothing)
+        self.bone_neck = LabeledToggle("Neck")
+        self.bone_neck.toggled.connect(lambda v: setattr(self.config.detection, 'bone_neck', v))
+        head_row.addWidget(self.bone_neck)
         
-        layout.addWidget(self.smooth_section)
+        head_row.addStretch()
+        bones_section.addLayout(head_row)
         
-        # Aim Target Settings
-        aim_section = SectionWidget("Aim Target")
+        # Torso bones row
+        torso_label = QLabel("Torso:")
+        torso_label.setStyleSheet("color: #94a3b8; font-size: 10px; margin-top: 6px;")
+        bones_section.addWidget(torso_label)
         
-        bone_row = QHBoxLayout()
-        bone_row.addWidget(QLabel("Target Point"))
-        bone_row.addStretch()
-        self.bone = QComboBox()
-        self.bone.addItems(["Top Head", "Upper Head", "Head", "Neck", "Chest"])
-        self.bone.setFixedWidth(100)
-        self.bone.currentTextChanged.connect(self._on_bone)
-        bone_row.addWidget(self.bone)
-        aim_section.addLayout(bone_row)
+        torso_row1 = QHBoxLayout()
+        self.bone_upper_chest = LabeledToggle("Upper Chest")
+        self.bone_upper_chest.toggled.connect(lambda v: setattr(self.config.detection, 'bone_upper_chest', v))
+        torso_row1.addWidget(self.bone_upper_chest)
         
-        self.bone_scale = SliderWidget("Scale", 0.5, 2.0, 1.0, decimals=2)
+        self.bone_chest = LabeledToggle("Chest")
+        self.bone_chest.toggled.connect(lambda v: setattr(self.config.detection, 'bone_chest', v))
+        torso_row1.addWidget(self.bone_chest)
+        
+        self.bone_lower_chest = LabeledToggle("Lower Chest")
+        self.bone_lower_chest.toggled.connect(lambda v: setattr(self.config.detection, 'bone_lower_chest', v))
+        torso_row1.addWidget(self.bone_lower_chest)
+        
+        torso_row1.addStretch()
+        bones_section.addLayout(torso_row1)
+        
+        torso_row2 = QHBoxLayout()
+        self.bone_upper_stomach = LabeledToggle("Upper Stomach")
+        self.bone_upper_stomach.toggled.connect(lambda v: setattr(self.config.detection, 'bone_upper_stomach', v))
+        torso_row2.addWidget(self.bone_upper_stomach)
+        
+        self.bone_stomach = LabeledToggle("Stomach")
+        self.bone_stomach.toggled.connect(lambda v: setattr(self.config.detection, 'bone_stomach', v))
+        torso_row2.addWidget(self.bone_stomach)
+        
+        self.bone_lower_stomach = LabeledToggle("Lower Stomach")
+        self.bone_lower_stomach.toggled.connect(lambda v: setattr(self.config.detection, 'bone_lower_stomach', v))
+        torso_row2.addWidget(self.bone_lower_stomach)
+        
+        self.bone_pelvis = LabeledToggle("Pelvis")
+        self.bone_pelvis.toggled.connect(lambda v: setattr(self.config.detection, 'bone_pelvis', v))
+        torso_row2.addWidget(self.bone_pelvis)
+        
+        torso_row2.addStretch()
+        bones_section.addLayout(torso_row2)
+        
+        # Bone Scale
+        self.bone_scale = SliderWidget("Bone Scale", 0.5, 2.0, 1.0, decimals=2)
+        self.bone_scale.setToolTip("Scale factor for bone position within bounding box")
         self.bone_scale.valueChanged.connect(lambda v: setattr(self.config.detection, 'bone_scale', v))
-        aim_section.addWidget(self.bone_scale)
+        bones_section.addWidget(self.bone_scale)
         
-        self.color_head_offset = SliderWidget("Head Offset", 0.0, 1.0, 0.15, decimals=2)
-        self.color_head_offset.valueChanged.connect(lambda v: setattr(self.config.detection, 'color_head_offset', v))
-        aim_section.addWidget(self.color_head_offset)
+        layout.addWidget(bones_section)
         
-        layout.addWidget(aim_section)
+        # ============ Class Filter Section ============
+        class_section = SectionWidget("Class Filter")
+        
+        filter_label = QLabel("Prioritize classes (checked = higher priority):")
+        filter_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        class_section.addWidget(filter_label)
+        
+        filter_row = QHBoxLayout()
+        self.class_filter_0 = LabeledToggle("Class Filter 0")
+        self.class_filter_0.toggled.connect(lambda v: setattr(self.config.detection, 'class_filter_0', v))
+        filter_row.addWidget(self.class_filter_0)
+        
+        self.class_filter_1 = LabeledToggle("Class Filter 1")
+        self.class_filter_1.toggled.connect(lambda v: setattr(self.config.detection, 'class_filter_1', v))
+        filter_row.addWidget(self.class_filter_1)
+        
+        self.class_filter_2 = LabeledToggle("Class Filter 2")
+        self.class_filter_2.toggled.connect(lambda v: setattr(self.config.detection, 'class_filter_2', v))
+        filter_row.addWidget(self.class_filter_2)
+        
+        self.class_filter_3 = LabeledToggle("Class Filter 3")
+        self.class_filter_3.toggled.connect(lambda v: setattr(self.config.detection, 'class_filter_3', v))
+        filter_row.addWidget(self.class_filter_3)
+        
+        filter_row.addStretch()
+        class_section.addLayout(filter_row)
+        
+        layout.addWidget(class_section)
+        
+        # ============ Disable Classes Section ============
+        disable_section = SectionWidget("Disable Classes")
+        
+        disable_label = QLabel("Completely ignore these classes:")
+        disable_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        disable_section.addWidget(disable_label)
+        
+        disable_row = QHBoxLayout()
+        self.class_disable_0 = LabeledToggle("Disable Class 0")
+        self.class_disable_0.toggled.connect(lambda v: setattr(self.config.detection, 'class_disable_0', v))
+        disable_row.addWidget(self.class_disable_0)
+        
+        self.class_disable_1 = LabeledToggle("Disable Class 1")
+        self.class_disable_1.toggled.connect(lambda v: setattr(self.config.detection, 'class_disable_1', v))
+        disable_row.addWidget(self.class_disable_1)
+        
+        self.class_disable_2 = LabeledToggle("Disable Class 2")
+        self.class_disable_2.toggled.connect(lambda v: setattr(self.config.detection, 'class_disable_2', v))
+        disable_row.addWidget(self.class_disable_2)
+        
+        self.class_disable_3 = LabeledToggle("Disable Class 3")
+        self.class_disable_3.toggled.connect(lambda v: setattr(self.config.detection, 'class_disable_3', v))
+        disable_row.addWidget(self.class_disable_3)
+        
+        disable_row.addStretch()
+        disable_section.addLayout(disable_row)
+        
+        layout.addWidget(disable_section)
+        
+        # ============ Enemy Color Filter Section ============
+        filter_section = SectionWidget("Enemy Color Filter")
+        
+        self.enemy_color_enabled = LabeledToggle("Enable Color Filter")
+        self.enemy_color_enabled.setToolTip("Filter detections by enemy outline color\nUsed to exclude teammates")
+        self.enemy_color_enabled.toggled.connect(lambda v: setattr(self.config.filtering, 'enemy_color_enabled', v))
+        filter_section.addWidget(self.enemy_color_enabled)
+        
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Enemy Color"))
+        color_row.addStretch()
+        self.enemy_color = QComboBox()
+        self.enemy_color.addItems(["purple", "purple_tight", "pink", "yellow", "red"])
+        self.enemy_color.setFixedWidth(120)
+        self.enemy_color.currentTextChanged.connect(lambda t: setattr(self.config.filtering, 'enemy_color', t))
+        color_row.addWidget(self.enemy_color)
+        filter_section.addLayout(color_row)
+        
+        layout.addWidget(filter_section)
+        
         layout.addStretch()
         
         scroll.setWidget(content)
         main = QVBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
         main.addWidget(scroll)
+        
+        # Initial model scan
+        self._refresh_models()
     
     def _load_config(self):
-        # Block all signals
+        """Load configuration values into UI"""
+        d = self.config.detection
+        f = self.config.filtering
+        
+        # Block all signals during load
         widgets = [
-            self.bone_scale, self.bone,
-            self.color_preset, self.color_device, self.color_h_min, self.color_h_max, self.color_s_min, self.color_s_max,
-            self.color_v_min, self.color_v_max, self.color_dilate, self.color_erode,
-            self.color_min_area, self.color_max_area, self.color_head_offset,
-            self.blur_enabled, self.blur_size, self.smoothing_enabled, self.smoothing_window,
-            self.smoothing_outlier, self.bbox_smoothing
+            self.backend, self.gpu_provider, self.model_file, self.confidence, self.model_type,
+            self.trt_level, self.async_inference, self.use_subprocess,
+            self.bone_top_head, self.bone_upper_head, self.bone_head, self.bone_neck,
+            self.bone_upper_chest, self.bone_chest, self.bone_lower_chest,
+            self.bone_upper_stomach, self.bone_stomach, self.bone_lower_stomach, self.bone_pelvis,
+            self.bone_scale,
+            self.class_filter_0, self.class_filter_1, self.class_filter_2, self.class_filter_3,
+            self.class_disable_0, self.class_disable_1, self.class_disable_2, self.class_disable_3,
+            self.enemy_color_enabled, self.enemy_color
         ]
         for w in widgets:
             w.blockSignals(True)
         
-        d = self.config.detection
+        # Backend & Model
+        backend_map = {"tensorrt": "TensorRT", "onnx": "ONNX"}
+        self.backend.setCurrentText(backend_map.get(d.backend, "ONNX"))
         
-        # Aim target settings
+        # GPU Provider
+        provider_map = {"cuda": "CUDA", "directml": "DirectML", "cpu": "CPU"}
+        self.gpu_provider.setCurrentText(provider_map.get(d.onnx_provider, "CUDA"))
+        
+        # Find model file in dropdown
+        model_name = d.model_file.split("/")[-1].split("\\")[-1] if d.model_file else ""
+        idx = self.model_file.findText(model_name)
+        if idx >= 0:
+            self.model_file.setCurrentIndex(idx)
+        
+        # Confidence
+        conf_str = str(d.confidence)
+        idx = self.confidence.findText(conf_str)
+        if idx >= 0:
+            self.confidence.setCurrentIndex(idx)
+        else:
+            self.confidence.setCurrentText(conf_str)
+        
+        # Model Settings
+        type_map = {"object_detection": "Object Detection", "pose_estimation": "Pose Estimation"}
+        self.model_type.setCurrentText(type_map.get(d.model_type, "Object Detection"))
+        self.trt_level.setCurrentIndex(d.trt_optimization)
+        self.async_inference.setChecked(d.async_inference)
+        self.use_subprocess.setChecked(d.use_subprocess)
+        
+        # Aim Bones
+        self.bone_top_head.setChecked(d.bone_top_head)
+        self.bone_upper_head.setChecked(d.bone_upper_head)
+        self.bone_head.setChecked(d.bone_head)
+        self.bone_neck.setChecked(d.bone_neck)
+        self.bone_upper_chest.setChecked(d.bone_upper_chest)
+        self.bone_chest.setChecked(d.bone_chest)
+        self.bone_lower_chest.setChecked(d.bone_lower_chest)
+        self.bone_upper_stomach.setChecked(d.bone_upper_stomach)
+        self.bone_stomach.setChecked(d.bone_stomach)
+        self.bone_lower_stomach.setChecked(d.bone_lower_stomach)
+        self.bone_pelvis.setChecked(d.bone_pelvis)
         self.bone_scale.setValue(d.bone_scale)
-        bone_map = {"top_head": "Top Head", "upper_head": "Upper Head", "head": "Head",
-                    "neck": "Neck", "chest": "Chest"}
-        self.bone.setCurrentText(bone_map.get(d.aim_bone, "Upper Head"))
         
-        # Color settings
-        self.color_preset.setCurrentText(d.color_preset)
-        self.color_device.setCurrentText("GPU" if d.color_device == "gpu" else "CPU")
-        self.color_h_min.setValue(d.color_h_min)
-        self.color_h_max.setValue(d.color_h_max)
-        self.color_s_min.setValue(d.color_s_min)
-        self.color_s_max.setValue(d.color_s_max)
-        self.color_v_min.setValue(d.color_v_min)
-        self.color_v_max.setValue(d.color_v_max)
-        self.color_dilate.setValue(d.color_dilate)
-        self.color_erode.setValue(d.color_erode)
-        self.color_min_area.setValue(d.color_min_area)
-        self.color_max_area.setValue(d.color_max_area)
-        self.color_head_offset.setValue(d.color_head_offset)
+        # Class Filter
+        self.class_filter_0.setChecked(d.class_filter_0)
+        self.class_filter_1.setChecked(d.class_filter_1)
+        self.class_filter_2.setChecked(d.class_filter_2)
+        self.class_filter_3.setChecked(d.class_filter_3)
         
-        # Blur and smoothing
-        self.blur_enabled.setChecked(d.color_blur_enabled)
-        self.blur_size.setValue(d.color_blur_size)
-        self.smoothing_enabled.setChecked(d.smoothing_enabled)
-        self.smoothing_window.setValue(d.smoothing_window)
-        self.smoothing_outlier.setValue(d.smoothing_outlier)
-        self.bbox_smoothing.setValue(d.bbox_smoothing)
+        # Disable Classes
+        self.class_disable_0.setChecked(d.class_disable_0)
+        self.class_disable_1.setChecked(d.class_disable_1)
+        self.class_disable_2.setChecked(d.class_disable_2)
+        self.class_disable_3.setChecked(d.class_disable_3)
+        
+        # Enemy Color Filter
+        self.enemy_color_enabled.setChecked(f.enemy_color_enabled)
+        self.enemy_color.setCurrentText(f.enemy_color)
         
         # Unblock all signals
         for w in widgets:
             w.blockSignals(False)
     
-    def _on_preset_change(self, text: str):
-        """Handle color preset change"""
-        self.config.detection.color_preset = text
+    def _refresh_models(self):
+        """Scan models folder and populate dropdown"""
+        import os
+        models_dir = "models"
+        self.model_file.clear()
+        self.model_file.addItem("")  # Empty option
         
-        # Apply preset values to UI
-        from ...detection.color_detector import COLOR_PRESETS
-        if text in COLOR_PRESETS:
-            preset = COLOR_PRESETS[text]
-            self.color_h_min.setValue(preset["h_min"])
-            self.color_h_max.setValue(preset["h_max"])
-            self.color_s_min.setValue(preset["s_min"])
-            self.color_s_max.setValue(preset["s_max"])
-            self.color_v_min.setValue(preset["v_min"])
-            self.color_v_max.setValue(preset["v_max"])
+        if os.path.exists(models_dir):
+            for f in sorted(os.listdir(models_dir)):
+                ext = f.split(".")[-1].lower()
+                if ext in ["onnx", "engine", "enc", "xml"]:
+                    self.model_file.addItem(f)
     
-    def _set_custom(self, attr: str, value):
-        """Set custom color value and switch to custom preset"""
-        setattr(self.config.detection, attr, value)
-        if self.color_preset.currentText() != "custom":
-            self.color_preset.blockSignals(True)
-            self.color_preset.setCurrentText("custom")
-            self.config.detection.color_preset = "custom"
-            self.color_preset.blockSignals(False)
+    def _on_backend_change(self, text: str):
+        """Handle backend selection change"""
+        backend_map = {"TensorRT": "tensorrt", "ONNX": "onnx"}
+        self.config.detection.backend = backend_map.get(text, "onnx")
     
-    def _on_bone(self, text):
-        bone_map = {"Top Head": "top_head", "Upper Head": "upper_head", "Head": "head",
-                    "Neck": "neck", "Chest": "chest"}
-        self.config.detection.aim_bone = bone_map.get(text, "upper_head")
+    def _on_provider_change(self, text: str):
+        """Handle GPU provider selection change"""
+        provider_map = {"CUDA": "cuda", "DirectML": "directml", "CPU": "cpu"}
+        self.config.detection.onnx_provider = provider_map.get(text, "cuda")
+    
+    def _on_model_change(self, text: str):
+        """Handle model file selection change"""
+        if text:
+            self.config.detection.model_file = f"models/{text}"
+        else:
+            self.config.detection.model_file = ""
+    
+    def _on_confidence_change(self, text: str):
+        """Handle confidence threshold change"""
+        try:
+            self.config.detection.confidence = int(text)
+        except ValueError:
+            pass
+    
+    def _on_model_type_change(self, text: str):
+        """Handle model type change"""
+        type_map = {"Object Detection": "object_detection", "Pose Estimation": "pose_estimation"}
+        self.config.detection.model_type = type_map.get(text, "object_detection")
 
 
 class MouseSettings(QWidget):
@@ -398,25 +588,6 @@ class MouseSettings(QWidget):
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
         layout.setContentsMargins(0, 0, 10, 0)
-        
-        # Device
-        dev = SectionWidget("Device")
-        
-        dev_row = QHBoxLayout()
-        dev_row.addWidget(QLabel("Method"))
-        dev_row.addStretch()
-        self.device = QComboBox()
-        self.device.addItems(["Internal (SendInput)"])
-        self.device.setFixedWidth(140)
-        dev_row.addWidget(self.device)
-        dev.addLayout(dev_row)
-        
-        # Info label pointing to Mouse tab
-        info_label = QLabel("Configure button blocking in Mouse tab")
-        info_label.setStyleSheet("color: #64748b; font-size: 9px;")
-        dev.addWidget(info_label)
-        
-        layout.addWidget(dev)
         
         # Sensitivity
         sens = SectionWidget("Sensitivity")
@@ -645,7 +816,7 @@ class SettingsTab(QWidget):
         """)
         
         self.tabs.addTab(CaptureSettings(self.config), "Capture")
-        self.tabs.addTab(DetectionSettings(self.config), "Detection")
+        self.tabs.addTab(DetectionSettings(self.config), "Detection/Model")
         self.tabs.addTab(MouseSettings(self.config), "Mouse")
         self.tabs.addTab(TrackingSettings(self.config), "Tracking")
         

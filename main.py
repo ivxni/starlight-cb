@@ -27,6 +27,44 @@ warnings.filterwarnings("ignore", message=".*CUDA path could not be detected.*")
 # This helps with UDP streams without needing URL parameters
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0"
 
+# Pre-load NVIDIA cuDNN/cuBLAS DLLs for CUDA support
+# Must happen BEFORE onnxruntime import AND before PyQt6
+# Uses ctypes to force-load DLLs into process memory
+try:
+    import ctypes
+    import importlib.util
+    _nvidia_dlls_loaded = []
+    for pkg in ["nvidia.cudnn", "nvidia.cublas", "nvidia.cuda_runtime"]:
+        spec = importlib.util.find_spec(pkg)
+        if spec and spec.submodule_search_locations:
+            bin_path = os.path.join(spec.submodule_search_locations[0], "bin")
+            if os.path.isdir(bin_path):
+                os.add_dll_directory(bin_path)
+                os.environ["PATH"] = bin_path + os.pathsep + os.environ.get("PATH", "")
+                # Force-load key DLLs into process memory
+                for dll_name in os.listdir(bin_path):
+                    if dll_name.endswith(".dll"):
+                        dll_path = os.path.join(bin_path, dll_name)
+                        try:
+                            ctypes.WinDLL(dll_path)
+                            _nvidia_dlls_loaded.append(dll_name)
+                        except OSError:
+                            pass
+    if _nvidia_dlls_loaded:
+        print(f"Pre-loaded {len(_nvidia_dlls_loaded)} NVIDIA DLLs (cuDNN/cuBLAS)")
+except Exception as e:
+    print(f"NVIDIA DLL pre-load: {e}")
+
+# IMPORTANT: Import onnxruntime BEFORE PyQt6
+# PyQt6 modifies Windows DLL search paths, which breaks onnxruntime DLL loading
+try:
+    import onnxruntime
+    print(f"ONNX Runtime pre-loaded (providers: {onnxruntime.get_available_providers()})")
+except ImportError:
+    pass
+except Exception as e:
+    print(f"ONNX Runtime pre-load warning: {e}")
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont

@@ -88,7 +88,8 @@ class FlickTriggerTab(QWidget):
         tkey_row.addWidget(self.trigger_key)
         trigger.addLayout(tkey_row)
         
-        self.trigger_scale = SliderWidget("Scale", 1, 100, 24, suffix="%")
+        self.trigger_scale = SliderWidget("Trigger Scale", 1, 100, 50, suffix="%")
+        self.trigger_scale.setToolTip("How much of the bounding box crosshair must be within\nLow (10-30%) = stricter, must be near center\nHigh (50-80%) = more lenient")
         self.trigger_scale.valueChanged.connect(lambda v: setattr(self.config.trigger, 'trigger_scale', int(v)))
         trigger.addWidget(self.trigger_scale)
         
@@ -101,7 +102,7 @@ class FlickTriggerTab(QWidget):
         self.first_shot.rangeChanged.connect(self._on_first_shot)
         timing.addWidget(self.first_shot)
         
-        self.multi_shot = RangeSliderWidget("Multi-Shot Delay", 0, 200, 40, 45, suffix="ms")
+        self.multi_shot = RangeSliderWidget("Multi-Shot Delay", 0, 5000, 170, 210, suffix="ms")
         self.multi_shot.rangeChanged.connect(self._on_multi_shot)
         timing.addWidget(self.multi_shot)
         
@@ -137,7 +138,7 @@ class FlickTriggerTab(QWidget):
         self.flick_key.setCurrentText(key_map.get(f.flick_key, "Back Button"))
         
         self.trigger_enabled.setChecked(t.enabled)
-        self.trigger_scale.setValue(t.trigger_scale)
+        self.trigger_scale.setValue(getattr(t, 'trigger_scale', 50))
         self.trigger_key.setCurrentText(key_map.get(t.trigger_key, "Back Button"))
         self.first_shot.setMinValue(t.first_shot_delay_min)
         self.first_shot.setMaxValue(t.first_shot_delay_max)
